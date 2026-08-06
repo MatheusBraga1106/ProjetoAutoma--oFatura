@@ -1,0 +1,18 @@
+# Pastas de processamento (dados de entrada/saída reais, nunca versionar)
+dados_entrada/
+dados_saida/
+
+# Dados sensíveis (contas, faturas reais)
+contas.json
+contasAntigo.json
+*.faturas.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# SO
+.DS_Store
+Thumbs.db

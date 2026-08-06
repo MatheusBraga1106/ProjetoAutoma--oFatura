@@ -1,0 +1,16 @@
+[
+    {
+        "id_CONTA": 1,
+        "id_UJ": 1,
+        "id_ORDEM": 100,
+        "CONTA_DV": "0000 0",
+        "CONTA": 10000,
+        "UNIDADE": "Unidade Exemplo",
+        "ENDERECO": "Rua Exemplo, s/n, Cidade Exemplo - UF",
+        "DISTRIBUIDORA": "SANEAGO",
+        "OPERANTE": true,
+        "AGUA": true,
+        "ESGOTO": false,
+        "SMRSU": true
+    }
+]
