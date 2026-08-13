@@ -18,6 +18,8 @@ from extratores.saae_mineiros import extrair_saae_mineiros
 # from extratores.sanesc import extrair_sanesc
 # from extratores.chesp import extrair_chesp
 
+from extratores.ocr_fallback import eh_texto_ocr
+
 
 def normalizar_texto(texto):
     """Remove acentos e coloca em minúsculas para facilitar a correspondência no IF"""
@@ -77,7 +79,7 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
                 empresa_identificada = "SANEAGO_ANALITICA"
                 
             elif "saneago" in alvo_busca and "analitica" not in alvo_busca:
-                df_extraido = extrair_saneago(caminho_completo)
+                df_extraido = extrair_saneago(caminho_completo, is_ocr=eh_texto_ocr(caminho_completo))
                 empresa_identificada = "SANEAGO"
                 
             elif "codego" in alvo_busca:
@@ -214,7 +216,8 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
                 df_info_contas = pd.read_json(caminho_json)
 
                 colunas_json = [
-                    "CONTA_DV", "UNIDADE JUDICIÁRIA", "ENDEREÇO", "DISTRIBUIDORA","OPERANTE - FILTRO"
+                    "CONTA_DV", "UNIDADE JUDICIÁRIA", "ENDEREÇO", "DISTRIBUIDORA",
+                    "AGUA", "ESGOTO", "SMRSU"
                 ]
                 colunas_existentes = [col for col in colunas_json if col in df_info_contas.columns]
                 df_info_contas = df_info_contas[colunas_existentes]
@@ -224,32 +227,27 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
 
                 df_novo_lote = pd.merge(df_novo_lote, df_info_contas, on="CONTA_DV", how="left")
 
+                # Contas sem correspondência no JSON não têm flag nenhuma (não é "tem as 3"),
+                # senão a checagem "not (AGUA or ESGOTO or SMRSU)" trata NaN como verdadeiro.
+                for col_flag in ["AGUA", "ESGOTO", "SMRSU"]:
+                    if col_flag in df_novo_lote.columns:
+                        df_novo_lote[col_flag] = df_novo_lote[col_flag].fillna(False).astype(bool)
+
 
                 # =========================================================
                 # 🛡️ NOVA CAMADA DE CONFERÊNCIA: REDISTRIBUIÇÃO DE VALORES
+                # Conservadora: nunca desloca um valor extraído de uma
+                # categoria pra outra (isso já é responsabilidade de cada
+                # extrator). Só ZERA um valor que caiu numa categoria que a
+                # conta não tem cadastrada no contas.json.
                 # =========================================================
                 def corrigir_distribuicao_financeira(row):
-                    valores_encontrados = []
-                    if pd.notna(row.get('VALOR_AGUA')) and row['VALOR_AGUA'] > 0: valores_encontrados.append(row['VALOR_AGUA'])
-                    if pd.notna(row.get('VALOR_ESGOTO')) and row['VALOR_ESGOTO'] > 0: valores_encontrados.append(row['VALOR_ESGOTO'])
-                    if pd.notna(row.get('VALOR_TAXAS_EXTRAS')) and row['VALOR_TAXAS_EXTRAS'] > 0: valores_encontrados.append(row['VALOR_TAXAS_EXTRAS'])
-                    
                     if not (row.get('AGUA', False) or row.get('ESGOTO', False) or row.get('SMRSU', False)):
                         return row.get('VALOR_AGUA', 0.0), row.get('VALOR_ESGOTO', 0.0), row.get('VALOR_TAXAS_EXTRAS', 0.0)
-                        
-                    agua, esgoto, smrsu = 0.0, 0.0, 0.0
-                    idx = 0
-                    
-                    if row.get('AGUA', False) and idx < len(valores_encontrados):
-                        agua = valores_encontrados[idx]
-                        idx += 1
-                    if row.get('ESGOTO', False) and idx < len(valores_encontrados):
-                        esgoto = valores_encontrados[idx]
-                        idx += 1
-                    if row.get('SMRSU', False) and idx < len(valores_encontrados):
-                        smrsu = valores_encontrados[idx]
-                        idx += 1
-                        
+
+                    agua = row.get('VALOR_AGUA', 0.0) if row.get('AGUA', False) else 0.0
+                    esgoto = row.get('VALOR_ESGOTO', 0.0) if row.get('ESGOTO', False) else 0.0
+                    smrsu = row.get('VALOR_TAXAS_EXTRAS', 0.0) if row.get('SMRSU', False) else 0.0
                     return agua, esgoto, smrsu
 
                 df_novo_lote[['VALOR_AGUA', 'VALOR_ESGOTO', 'VALOR_TAXAS_EXTRAS']] = df_novo_lote.apply(
