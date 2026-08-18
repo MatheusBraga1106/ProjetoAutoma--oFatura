@@ -19,6 +19,7 @@ from extratores.saae_mineiros import extrair_saae_mineiros
 # from extratores.chesp import extrair_chesp
 
 from extratores.ocr_fallback import eh_texto_ocr, detectar_faturas_sem_texto, gerar_txt_via_ocr
+from extratores.pdftotext_fallback import converter_pdf_para_txt
 
 
 def normalizar_texto(texto):
@@ -49,10 +50,21 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
     print(f"🕷️ A iniciar rastreamento na pasta raiz: '{pasta_raiz}'\n")
 
     # =========================================================
-    # FALLBACK OCR: antes de rotear, gera via Tesseract o .txt de
-    # qualquer PDF que o pdftotext não conseguiu ler (fatura-imagem,
-    # sem camada de texto). O .txt sai marcado e cai no walk abaixo
-    # como qualquer outro.
+    # ETAPA 1 - PDFTOTEXT: antes de rotear, tenta extrair o .txt de
+    # qualquer PDF ainda sem texto pareado via pdftotext (rápido, só
+    # funciona em PDFs com camada de texto real).
+    # =========================================================
+    faturas_sem_texto = detectar_faturas_sem_texto(pasta_raiz)
+    if faturas_sem_texto:
+        print(f"📄 {len(faturas_sem_texto)} fatura(s) sem texto extraível — tentando via pdftotext...\n")
+        for caminho_pdf, caminho_txt in faturas_sem_texto:
+            converter_pdf_para_txt(caminho_pdf, caminho_txt)
+        print()
+
+    # =========================================================
+    # ETAPA 2 - FALLBACK OCR: para o que o pdftotext não resolveu
+    # (fatura-imagem, sem camada de texto), gera o .txt via Tesseract.
+    # O .txt sai marcado e cai no walk abaixo como qualquer outro.
     # =========================================================
     faturas_sem_texto = detectar_faturas_sem_texto(pasta_raiz)
     if faturas_sem_texto:

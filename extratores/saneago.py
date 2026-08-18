@@ -65,7 +65,7 @@ def extrair_saneago(caminho_txt, is_ocr=False, contas_conhecidas=None):
         except (ValueError, InvalidOperation):
             return Decimal('0.00')
 
-    for linha in linhas:
+    for i, linha in enumerate(linhas):
         linha_bruta = linha.rstrip('\n')
 
         if is_ocr:
@@ -90,7 +90,9 @@ def extrair_saneago(caminho_txt, is_ocr=False, contas_conhecidas=None):
         match_venc = re.search(r'VENCIMENTO:\s*([\d/]+)', linha_bruta, re.IGNORECASE)
         if match_venc: meta_vencimento = match_venc.group(1)
 
-        if "NOME DO ÓRGÃO AGRUPADOR" in linha_upper:
+        # Mesmo motivo do gatilho da tabela: alguns motores de pdftotext colam
+        # "NOME" e "DO" sem espaço ("NOMEDO ÓRGÃO AGRUPADOR").
+        if re.search(r'NOME\s*DO\s*ÓRGÃO\s*AGRUPADOR', linha_upper):
             capturando_orgao = True
             buffer_nome_orgao = []
             continue
@@ -111,8 +113,12 @@ def extrair_saneago(caminho_txt, is_ocr=False, contas_conhecidas=None):
         # =========================================================
         # 2. GATILHO E MÁQUINA DE ESTADOS
         # =========================================================
-        # GATILHO INFALÍVEL: Procura pelas colunas exatas da mesma linha
-        if "CONTA - DV" in linha_upper and "NOME CLIENTE" in linha_upper:
+        # GATILHO INFALÍVEL: Procura pelas colunas exatas da mesma linha.
+        # Espaçamento entre "CONTA"/"-"/"DV" e "NOME"/"CLIENTE" varia
+        # conforme o motor do pdftotext (o xpdf do Git for Windows funde
+        # "CONTA-DV" e "NOMECLIENTE" sem espaço; outros motores e o OCR
+        # preservam o espaço), então aceitamos zero ou mais espaços ali.
+        if re.search(r'CONTA\s*-\s*DV', linha_upper) and re.search(r'NOME\s*CLIENTE', linha_upper):
             dentro_da_tabela = True
 
             # Formato novo (a partir de ~11/2025): 1 coluna de consumo + 3 de
@@ -127,17 +133,34 @@ def extrair_saneago(caminho_txt, is_ocr=False, contas_conhecidas=None):
             # posição de caractere mesmo estando na mesma coluna visual da
             # tabela). Por isso pulamos o cálculo de posição pra OCR e
             # deixamos a atribuição cair na rede de segurança por ordem.
+            # As posições de coluna precisam ser medidas na linha BRUTA (sem
+            # strip), porque é nela que a posição dos valores é procurada
+            # mais abaixo (linha_bruta.find(val, ...)). Medir no texto
+            # stripado desalinha tudo quando o cabeçalho tem um recuo
+            # diferente da linha de dados (comum entre motores de pdftotext).
+            linha_bruta_upper = linha_bruta.upper()
+
+            # Em alguns arquivos os rótulos "ÁGUA ESGOTO SMRSU" saem numa
+            # linha à parte (não na mesma linha de "CONTA - DV"), então
+            # verificamos também a linha seguinte antes de desistir e cair
+            # no formato antigo (2 colunas).
+            linha_rotulos_upper = linha_bruta_upper
+            if "SMRSU" not in linha_upper and i + 1 < len(linhas):
+                proxima_bruta = linhas[i + 1].rstrip('\n')
+                if "SMRSU" in proxima_bruta.upper():
+                    linha_rotulos_upper = proxima_bruta.upper()
+
             if is_ocr:
                 col_agua_fim = col_esgoto_fim = col_smrsu_fim = None
-            elif "SMRSU" in linha_upper:
-                m_agua = re.search(r'ÁGUA', linha_upper)
-                m_esgoto = re.search(r'ESGOTO', linha_upper)
-                m_smrsu = re.search(r'SMRSU', linha_upper)
+            elif "SMRSU" in linha_rotulos_upper:
+                m_agua = re.search(r'ÁGUA', linha_rotulos_upper)
+                m_esgoto = re.search(r'ESGOTO', linha_rotulos_upper)
+                m_smrsu = re.search(r'SMRSU', linha_rotulos_upper)
                 col_agua_fim = m_agua.end() if m_agua else None
                 col_esgoto_fim = m_esgoto.end() if m_esgoto else None
                 col_smrsu_fim = m_smrsu.end() if m_smrsu else None
             else:
-                posicoes_valor = [m.end() for m in re.finditer(r'VALOR R\$', linha_upper)]
+                posicoes_valor = [m.end() for m in re.finditer(r'VALOR R\$', linha_bruta_upper)]
                 col_agua_fim = posicoes_valor[0] if len(posicoes_valor) > 0 else None
                 col_esgoto_fim = posicoes_valor[1] if len(posicoes_valor) > 1 else None
                 col_smrsu_fim = None

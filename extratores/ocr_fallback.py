@@ -6,6 +6,12 @@ import pymupdf
 import pytesseract
 from PIL import Image
 
+# As faturas vêm de pastas locais controladas pelo próprio usuário (não são
+# uploads de terceiros), então desativamos a trava de "decompression bomb"
+# do Pillow: em 400 DPI, páginas maiores que A4 passam do limite padrão
+# (~179M pixels) e derrubam o OCR sem motivo real de segurança aqui.
+Image.MAX_IMAGE_PIXELS = None
+
 # Marcador gravado na primeira linha de qualquer .txt gerado por este
 # módulo. É assim que o roteador do Main.py sabe que aquele texto veio de
 # OCR (não do pdftotext) e precisa avisar o extrator disso.
