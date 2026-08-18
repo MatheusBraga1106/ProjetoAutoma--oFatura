@@ -40,17 +40,38 @@ def localizar_tesseract():
 pytesseract.pytesseract.tesseract_cmd = localizar_tesseract()
 
 
+CARACTERE_SUBSTITUICAO = "�"  # "�" — surge quando o .txt foi gravado numa
+# codificação (ex.: Latin-1) diferente da que o pipeline usa pra ler (UTF-8).
+# Não é um caractere que apareça naturalmente em português; qualquer
+# ocorrência é sinal de que o .txt precisa ser regravado, não de que falta
+# texto nele.
+
+
+def tem_encoding_corrompido(conteudo):
+    """Verdadeiro se o texto tiver o caractere de substituição Unicode, sinal
+    de erro de codificação na conversão (pdftotext gravando Latin-1/cp1252
+    enquanto o resto do pipeline lê como UTF-8, por ex.). Isso corrompe
+    justamente os acentos do português (Ç, Ó, Â, É...), então até uma única
+    ocorrência já indica que o arquivo saiu errado."""
+    return CARACTERE_SUBSTITUICAO in conteudo
+
+
 def eh_texto_util(caminho_txt, min_chars=50):
-    """Um .txt é considerado 'útil' se existir e tiver conteúdo real.
-    PDFs que na verdade são imagem escaneada geram um .txt vazio (0 bytes)
-    quando passados pelo pdftotext, porque não existe camada de texto."""
+    """Um .txt é considerado 'útil' se existir, tiver conteúdo real e não
+    estar com a codificação corrompida. PDFs que na verdade são imagem
+    escaneada geram um .txt vazio (0 bytes) quando passados pelo pdftotext,
+    porque não existe camada de texto. Já um .txt com "�" no meio das
+    palavras existe e tem tamanho, mas está corrompido e precisa ser
+    reconvertido — do contrário o dado ruim segue direto pro CSV final."""
     if not os.path.exists(caminho_txt):
         return False
     try:
         conteudo = open(caminho_txt, encoding="utf-8", errors="replace").read().strip()
     except OSError:
         return False
-    return len(conteudo) >= min_chars
+    if len(conteudo) < min_chars:
+        return False
+    return not tem_encoding_corrompido(conteudo)
 
 
 def eh_texto_ocr(caminho_txt):
@@ -65,9 +86,11 @@ def eh_texto_ocr(caminho_txt):
 
 
 def detectar_faturas_sem_texto(pasta_raiz, min_chars=50):
-    """Varre pasta_raiz procurando PDFs cujo .txt pareado não existe ou
-    está vazio/quase vazio (PDF-imagem, sem camada de texto extraível).
-    Retorna uma lista de (caminho_pdf, caminho_txt)."""
+    """Varre pasta_raiz procurando PDFs cujo .txt pareado não existe, está
+    vazio/quase vazio (PDF-imagem, sem camada de texto extraível) ou está
+    com a codificação corrompida (cheio de "�" nos acentos). Nos três
+    casos o .txt precisa ser (re)gerado. Retorna uma lista de
+    (caminho_pdf, caminho_txt)."""
     faltantes = []
     for raiz, _subpastas, arquivos in os.walk(pasta_raiz):
         for arquivo in arquivos:

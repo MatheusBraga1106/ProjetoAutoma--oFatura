@@ -13,7 +13,10 @@ find ./ -type f -iname "*.pdf" -print0 | while IFS= read -r -d '' arquivo; do
     
     echo "Processando: $arquivo"
     # Faz a conversão
-    pdftotext -layout "$arquivo" "$nome_txt"
+    # -enc UTF-8: sem isso, o pdftotext do Git for Windows grava em
+    # Latin-1 e todo acento vira "�" quando o resto do pipeline lê o
+    # .txt como UTF-8.
+    pdftotext -layout -enc UTF-8 "$arquivo" "$nome_txt"
 done
 
 DATA2=$(date +%s)
