@@ -40,6 +40,18 @@ def localizar_tesseract():
 pytesseract.pytesseract.tesseract_cmd = localizar_tesseract()
 
 
+def caminho_longo(caminho):
+    """Aplica o prefixo '\\\\?\\' do Windows a um caminho absoluto, para não
+    esbarrar no limite clássico de 260 caracteres (MAX_PATH) em pastas
+    profundamente aninhadas — o mesmo truque que o Main.py já usa ao ler
+    os .txt, aqui replicado para as operações de PDF (PyMuPDF) e escrita
+    de .txt deste módulo."""
+    caminho_abs = os.path.abspath(caminho)
+    if os.name == 'nt' and not caminho_abs.startswith('\\\\?\\'):
+        caminho_abs = '\\\\?\\' + caminho_abs
+    return caminho_abs
+
+
 CARACTERE_SUBSTITUICAO = "�"  # "�" — surge quando o .txt foi gravado numa
 # codificação (ex.: Latin-1) diferente da que o pipeline usa pra ler (UTF-8).
 # Não é um caractere que apareça naturalmente em português; qualquer
@@ -63,6 +75,7 @@ def eh_texto_util(caminho_txt, min_chars=50):
     porque não existe camada de texto. Já um .txt com "�" no meio das
     palavras existe e tem tamanho, mas está corrompido e precisa ser
     reconvertido — do contrário o dado ruim segue direto pro CSV final."""
+    caminho_txt = caminho_longo(caminho_txt)
     if not os.path.exists(caminho_txt):
         return False
     try:
@@ -78,7 +91,7 @@ def eh_texto_ocr(caminho_txt):
     """Detecta se um .txt já existente foi gerado por este módulo (em vez
     de vir do pdftotext), lendo só a primeira linha."""
     try:
-        with open(caminho_txt, encoding="utf-8", errors="replace") as f:
+        with open(caminho_longo(caminho_txt), encoding="utf-8", errors="replace") as f:
             primeira_linha = f.readline().strip()
     except OSError:
         return False
@@ -107,7 +120,7 @@ def ocr_pdf(caminho_pdf, dpi=DPI_PADRAO, psm=PSM_PADRAO, lang=IDIOMA_PADRAO, cal
     """Rasteriza cada página do PDF (via PyMuPDF, sem depender do poppler)
     e roda o Tesseract em cima da imagem. Retorna o texto de todas as
     páginas concatenado com quebra de linha entre elas."""
-    doc = pymupdf.open(caminho_pdf)
+    doc = pymupdf.open(caminho_longo(caminho_pdf))
     zoom = dpi / 72
     mat = pymupdf.Matrix(zoom, zoom)
     config = f"--psm {psm}"
@@ -137,7 +150,7 @@ def gerar_txt_via_ocr(caminho_pdf, caminho_txt=None, forcar=False, **kwargs_ocr)
         return None
 
     texto = ocr_pdf(caminho_pdf, **kwargs_ocr)
-    with open(caminho_txt, "w", encoding="utf-8") as f:
+    with open(caminho_longo(caminho_txt), "w", encoding="utf-8") as f:
         f.write(MARCADOR_OCR + "\n")
         f.write(texto)
     return caminho_txt

@@ -1,6 +1,11 @@
 import os
+import sys
 import pandas as pd
 import unicodedata
+
+# Terminal sempre atualizado em tempo real (sem esperar o buffer encher),
+# mesmo quando a saída é redirecionada/capturada por outro processo.
+sys.stdout.reconfigure(line_buffering=True)
 
 # Importando os extratores prontos
 from extratores.saneago import extrair_saneago
@@ -20,6 +25,13 @@ from extratores.saae_mineiros import extrair_saae_mineiros
 
 from extratores.ocr_fallback import eh_texto_ocr, detectar_faturas_sem_texto, gerar_txt_via_ocr
 from extratores.pdftotext_fallback import converter_pdf_para_txt
+
+
+# Pasta onde este arquivo está, para resolver caminhos relativos sempre a
+# partir daqui — e não do diretório de onde o script foi chamado (isso
+# quebrava ao rodar pelo botão "Run" da IDE, cujo cwd é a raiz do
+# workspace, não a pasta do projeto).
+PASTA_BASE = os.path.dirname(os.path.abspath(__file__))
 
 
 def normalizar_texto(texto):
@@ -56,8 +68,10 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
     # =========================================================
     faturas_sem_texto = detectar_faturas_sem_texto(pasta_raiz)
     if faturas_sem_texto:
-        print(f"📄 {len(faturas_sem_texto)} fatura(s) sem texto extraível — tentando via pdftotext...\n")
-        for caminho_pdf, caminho_txt in faturas_sem_texto:
+        total_pdftotext = len(faturas_sem_texto)
+        print(f"📄 {total_pdftotext} fatura(s) sem texto extraível — tentando via pdftotext...\n")
+        for i, (caminho_pdf, caminho_txt) in enumerate(faturas_sem_texto, start=1):
+            print(f"   [{i}/{total_pdftotext}] pdftotext: {os.path.basename(caminho_pdf)}")
             converter_pdf_para_txt(caminho_pdf, caminho_txt)
         print()
 
@@ -68,16 +82,27 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
     # =========================================================
     faturas_sem_texto = detectar_faturas_sem_texto(pasta_raiz)
     if faturas_sem_texto:
-        print(f"🖨️ {len(faturas_sem_texto)} fatura(s) sem texto extraível — gerando via OCR (Tesseract)...\n")
-        for caminho_pdf, caminho_txt in faturas_sem_texto:
-            print(f"   OCR: {os.path.basename(caminho_pdf)}")
-            gerar_txt_via_ocr(caminho_pdf, caminho_txt)
+        total_ocr = len(faturas_sem_texto)
+        print(f"🖨️ {total_ocr} fatura(s) sem texto extraível — gerando via OCR (Tesseract)...\n")
+        for i, (caminho_pdf, caminho_txt) in enumerate(faturas_sem_texto, start=1):
+            print(f"   [{i}/{total_ocr}] OCR: {os.path.basename(caminho_pdf)}")
+            try:
+                gerar_txt_via_ocr(caminho_pdf, caminho_txt)
+            except Exception as e:
+                print(f"   ⚠️ Falhou o OCR deste arquivo, seguindo para o próximo: {e}")
         print()
+
+    total_txt = sum(
+        1 for _raiz, _subpastas, arquivos in os.walk(pasta_raiz)
+        for f in arquivos if f.lower().endswith('.txt')
+    )
+    arquivos_processados = 0
 
     for diretorio_atual, subpastas, arquivos in os.walk(pasta_raiz):
         arquivos_txt = [f for f in arquivos if f.lower().endswith('.txt')]
-        
+
         for arquivo in arquivos_txt:
+            arquivos_processados += 1
             # Cria o caminho absoluto (C:\...)
             caminho_completo = os.path.abspath(os.path.join(diretorio_atual, arquivo))
             
@@ -95,7 +120,7 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
             df_extraido = None
             empresa_identificada = None
 
-            print(f" Lendo: {arquivo} (Pasta: {os.path.basename(diretorio_atual)})")
+            print(f" [{arquivos_processados}/{total_txt}] Lendo: {arquivo} (Pasta: {os.path.basename(diretorio_atual)})")
 
             # =========================================================
             # ROTEADOR INTELIGENTE (TOTALMENTE ATIVADO)
@@ -237,7 +262,7 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
             # =========================================================
             # RELACIONAMENTO 2: ENRIQUECIMENTO DE DADOS COM O JSON
             # =========================================================
-            caminho_json = "contas.json" 
+            caminho_json = os.path.join(PASTA_BASE, "contas.json")
             if os.path.exists(caminho_json):
                 df_info_contas = pd.read_json(caminho_json)
 
@@ -325,7 +350,7 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
     print("="*70 + "\n")
 
 if __name__ == "__main__":
-    PASTA_RAIZ_DADOS = "./dados_entrada" 
-    PASTA_SAIDA = "./dados_saida"
-    
+    PASTA_RAIZ_DADOS = os.path.join(PASTA_BASE, "dados_entrada")
+    PASTA_SAIDA = os.path.join(PASTA_BASE, "dados_saida")
+
     rastrear_e_processar_pastas(PASTA_RAIZ_DADOS, PASTA_SAIDA)
