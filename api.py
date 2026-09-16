@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import unicodedata
 import uuid
@@ -6,6 +7,14 @@ from typing import List
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File
+
+# Os extratores originais imprimem emojis de debug (✅❌🔎...) via print().
+# Num console/ambiente cujo stdout não seja UTF-8 (comum no Windows, e
+# depende do locale da imagem base no Docker), isso derruba a extração
+# inteira com UnicodeEncodeError antes mesmo de chegar no try/except do
+# endpoint. Forçar UTF-8 aqui evita mexer nos prints de cada extrator.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from extratores.saneago import extrair_saneago
 from extratores.saneago_analitica import extrair_saneago_analitica
@@ -179,7 +188,12 @@ def extrair(arquivos: List[UploadFile] = File(...)):
                 })
                 continue
 
-            caminho_pdf = os.path.join(pasta_tmp, f"{uuid.uuid4().hex}_{arquivo.filename}")
+            # Nunca usar o nome recebido do cliente pra montar caminho em disco: pode
+            # conter "/" (o chamador tem liberdade de incluir contexto de pasta no nome,
+            # útil pra identificação — ver identificar_distribuidora) ou até ".." — um
+            # nome de arquivo de cliente nunca é confiável como caminho de sistema.
+            extensao = os.path.splitext(arquivo.filename)[1] or ".pdf"
+            caminho_pdf = os.path.join(pasta_tmp, f"{uuid.uuid4().hex}{extensao}")
             with open(caminho_pdf, "wb") as f:
                 f.write(arquivo.file.read())
 
