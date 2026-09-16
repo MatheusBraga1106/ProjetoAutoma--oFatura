@@ -1,0 +1,10 @@
+dados_entrada/
+dados_saida/
+contas.json
+contasAntigo.json
+*.faturas.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
