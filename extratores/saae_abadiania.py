@@ -25,9 +25,26 @@ def extrair_saae_abadiania(caminho_txt):
     # ✂️ A TESOURA SAAE ABADIÂNIA
     # =========================================================
     padrao_quebra = r'AUTENTICAÇ[AÃÂ]O NO VERSO'
-    
+
     faturas_separadas = re.split(padrao_quebra, texto_completo, flags=re.IGNORECASE)
     print(f"   ✂️ O ficheiro foi dividido em {len(faturas_separadas)} blocos.")
+
+    # =========================================================
+    # VALORES DE ÁGUA/ESGOTO — busca no texto inteiro, não por bloco
+    # =========================================================
+    # Confirmado nos dados reais: "AUTENTICAÇÃO NO VERSO" nunca separa duas
+    # faturas de fato (nenhum arquivo do corpus tem mais de 1 canhoto) — ele
+    # só separa a via detalhada (tabela TARIFA DE ÁGUA/ESGOTO) da 2ª via/
+    # reaviso (só o canhoto compacto, sem a tabela). Buscando por bloco, o
+    # canhoto (que só existe na 2ª via) "ganhava" e a tabela de valores (que
+    # só existe na 1ª via, sem canhoto) era descartada — água/esgoto saíam
+    # 0,00 na maioria das faturas mesmo com o valor certo presente no texto.
+    # Algumas faturas também acumulam mais de um mês de tarifa (fatura em
+    # atraso) — soma todas as ocorrências em vez de pegar só a 1ª.
+    todas_aguas = re.findall(r'TARIFA DE [AÁ]GUA.*?\s([\d\.,]+)\s*\n', texto_completo, re.IGNORECASE)
+    todos_esgotos = re.findall(r'TARIFA DE ESGOTO.*?\s([\d\.,]+)\s*\n', texto_completo, re.IGNORECASE)
+    agua_total_arquivo = round(sum(formatar_para_sql(v) for v in todas_aguas), 2)
+    esgoto_total_arquivo = round(sum(formatar_para_sql(v) for v in todos_esgotos), 2)
 
     for indice, pagina_texto in enumerate(faturas_separadas, start=1):
         if len(pagina_texto.strip()) < 100:
@@ -73,13 +90,10 @@ def extrair_saae_abadiania(caminho_txt):
         match_cons = re.search(r'(?:[A-Z]{3}/\d{2})\s+(\d+)\s+\d{3}\s+\d{2,3}', pagina_texto, re.IGNORECASE)
         consumo_f = formatar_para_sql(match_cons.group(1)) if match_cons else 0.0
 
-        # TARIFA DE AGUA(0000 a 0010 - 5,43 * 0010                                               54,30
-        match_agua = re.search(r'TARIFA DE [AÁ]GUA.*?\s([\d\.,]+)\s*\n', pagina_texto, re.IGNORECASE)
-        agua_f = formatar_para_sql(match_agua.group(1)) if match_agua else 0.0
-
-        # TARIFA DE ESGOTO (50%)                                                                 27,15
-        match_esgoto = re.search(r'TARIFA DE ESGOTO.*?\s([\d\.,]+)\s*\n', pagina_texto, re.IGNORECASE)
-        esgoto_f = formatar_para_sql(match_esgoto.group(1)) if match_esgoto else 0.0
+        # Água/esgoto vêm do texto inteiro do arquivo (ver comentário acima),
+        # não deste bloco — este bloco pode ser a via sem a tabela de valores.
+        agua_f = agua_total_arquivo
+        esgoto_f = esgoto_total_arquivo
 
         taxas_extras_f = round(total_f - agua_f - esgoto_f, 2)
 
