@@ -17,6 +17,23 @@
 
     let iniciado = false;
 
+    // Lista fechada em vez de texto livre: "SAAE Corumbá", "corumba" e
+    // "SAAE_CORUMBA" viravam três distribuidoras diferentes no banco.
+    async function carregarDistribuidoras() {
+        const resposta = await fetch("/dados/empresas");
+        if (!resposta.ok) return;
+        const { empresas } = await resposta.json();
+        for (const info of empresas) garantirOpcao(info.empresa);
+    }
+
+    function garantirOpcao(valor) {
+        if (!valor || [...campoConcessionaria.options].some((o) => o.value === valor)) return;
+        const opcao = document.createElement("option");
+        opcao.value = valor;
+        opcao.textContent = valor;
+        campoConcessionaria.appendChild(opcao);
+    }
+
     function mostrarStatusForm(texto, ehErro) {
         formStatus.textContent = texto;
         formStatus.hidden = false;
@@ -105,6 +122,10 @@
             botaoToggle.className = "botao secundario";
             botaoToggle.type = "button";
             botaoToggle.textContent = erro.status === "resolvido" ? "Reabrir" : "Marcar resolvido";
+            botaoToggle.setAttribute(
+                "aria-label",
+                `${botaoToggle.textContent}: reporte de ${erro.data_criacao}${erro.num_fatura ? `, fatura ${erro.num_fatura}` : ""}`
+            );
             botaoToggle.addEventListener("click", () => alternarStatus(erro.id, erro.status));
             tdAcao.appendChild(botaoToggle);
             tr.appendChild(tdAcao);
@@ -129,11 +150,13 @@
         iniciar() {
             if (iniciado) return;
             iniciado = true;
+            carregarDistribuidoras();
             carregarErros();
         },
         // Chamado pela aba "Dados" (botão "Reportar erro" de cada linha) pra
         // pré-preencher o form com a fatura já identificada.
         preencher({ concessionaria, numFatura, contaDv, mesAno }) {
+            garantirOpcao(concessionaria);
             campoConcessionaria.value = concessionaria || "";
             campoNumFatura.value = numFatura || "";
             campoContaDv.value = contaDv || "";

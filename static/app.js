@@ -21,6 +21,18 @@
     const ulErros = document.getElementById("ul-erros");
 
     const bannerStatus = document.getElementById("banner-status");
+    const statusUpload = document.getElementById("status-upload");
+
+    function mostrarStatusUpload(texto, tipo = "aviso") {
+        statusUpload.textContent = texto;
+        statusUpload.className = `status-inline ${tipo}`;
+        statusUpload.hidden = false;
+    }
+
+    function limparStatusUpload() {
+        statusUpload.hidden = true;
+        statusUpload.textContent = "";
+    }
 
     // Map<chave, File> — chave = caminho relativo (upload de pasta) ou nome
     const arquivosSelecionados = new Map();
@@ -30,9 +42,18 @@
     }
 
     function adicionarArquivos(fileList) {
+        let ignorados = 0;
         for (const file of fileList) {
-            if (!file.name.toLowerCase().endsWith(".pdf")) continue;
+            if (!file.name.toLowerCase().endsWith(".pdf")) {
+                ignorados++;
+                continue;
+            }
             arquivosSelecionados.set(chaveDoArquivo(file), file);
+        }
+        if (ignorados) {
+            mostrarStatusUpload(`${ignorados} arquivo(s) ignorado(s) por não serem PDF.`, "aviso");
+        } else {
+            limparStatusUpload();
         }
         renderizarSelecionados();
     }
@@ -74,6 +95,7 @@
         arquivosSelecionados.clear();
         inputArquivos.value = "";
         inputPasta.value = "";
+        limparStatusUpload();
         renderizarSelecionados();
     });
 
@@ -90,11 +112,12 @@
             formData.append("arquivos", file, chave);
         }
 
+        limparStatusUpload();
         let resposta;
         try {
             resposta = await fetch("/pipeline/jobs", { method: "POST", body: formData });
         } catch (erro) {
-            alert("Falha ao enviar os arquivos: " + erro);
+            mostrarStatusUpload("Falha ao enviar os arquivos: " + erro, "erro");
             botaoProcessar.disabled = false;
             botaoLimpar.disabled = false;
             return;
@@ -102,7 +125,7 @@
 
         if (!resposta.ok) {
             const detalhe = await resposta.json().catch(() => ({}));
-            alert("Erro ao criar o job: " + (detalhe.detail || resposta.statusText));
+            mostrarStatusUpload("Erro ao criar o processamento: " + (detalhe.detail || resposta.statusText), "erro");
             botaoProcessar.disabled = false;
             botaoLimpar.disabled = false;
             return;
@@ -167,7 +190,7 @@
 
         eventSource.addEventListener("erro", (evento) => {
             const dados = JSON.parse(evento.data);
-            alert("Erro no processamento: " + dados.erro);
+            mostrarStatusUpload("Erro no processamento: " + dados.erro, "erro");
             eventSource.close();
             botaoProcessar.disabled = false;
             botaoLimpar.disabled = false;
@@ -264,15 +287,38 @@
     const abaBotoes = document.querySelectorAll(".aba-botao");
     const abas = document.querySelectorAll(".aba");
 
-    abaBotoes.forEach((botao) => {
-        botao.addEventListener("click", () => {
-            const alvo = botao.dataset.aba;
-            abaBotoes.forEach((b) => b.classList.toggle("ativo", b === botao));
-            abas.forEach((aba) => { aba.hidden = aba.id !== `aba-${alvo}`; });
+    function ativarAba(botao) {
+        const alvo = botao.dataset.aba;
+        abaBotoes.forEach((b) => {
+            const ativo = b === botao;
+            b.classList.toggle("ativo", ativo);
+            b.setAttribute("aria-selected", String(ativo));
+            b.tabIndex = ativo ? 0 : -1;
+        });
+        abas.forEach((aba) => { aba.hidden = aba.id !== `aba-${alvo}`; });
 
-            // Só busca os dados na primeira vez que a aba é aberta.
-            if (alvo === "dados") window.Dados.iniciar();
-            if (alvo === "dashboards") window.Dashboard.iniciar();
+        // Só busca os dados na primeira vez que a aba é aberta.
+        if (alvo === "dados") window.Dados.iniciar();
+        if (alvo === "dashboards") window.Dashboard.iniciar();
+        if (alvo === "erros") window.Erros.iniciar();
+    }
+
+    abaBotoes.forEach((botao, indice) => {
+        botao.addEventListener("click", () => ativarAba(botao));
+        // Padrão ARIA de abas: setas/Home/End trocam de aba sem precisar de Tab.
+        botao.addEventListener("keydown", (evento) => {
+            const total = abaBotoes.length;
+            const destinos = {
+                ArrowRight: (indice + 1) % total,
+                ArrowLeft: (indice - 1 + total) % total,
+                Home: 0,
+                End: total - 1,
+            };
+            if (!(evento.key in destinos)) return;
+            evento.preventDefault();
+            const proximo = abaBotoes[destinos[evento.key]];
+            proximo.focus();
+            ativarAba(proximo);
         });
     });
 })();

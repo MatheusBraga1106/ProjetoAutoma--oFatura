@@ -10,34 +10,37 @@
     <header class="topo">
         <h1>💧 Extrator de Faturas de Água</h1>
         <p class="subtitulo">Envie faturas, acompanhe a extração e explore os dados já consolidados.</p>
-        <nav class="abas-nav">
-            <button class="aba-botao ativo" data-aba="processar" type="button">Processar</button>
-            <button class="aba-botao" data-aba="dados" type="button">Dados</button>
-            <button class="aba-botao" data-aba="dashboards" type="button">Dashboards</button>
-            <button class="aba-botao" data-aba="erros" type="button">Erros</button>
+        <nav class="abas-nav" role="tablist" aria-label="Seções">
+            <button class="aba-botao ativo" data-aba="processar" type="button" role="tab" id="aba-botao-processar" aria-controls="aba-processar" aria-selected="true">Processar</button>
+            <button class="aba-botao" data-aba="dados" type="button" role="tab" id="aba-botao-dados" aria-controls="aba-dados" aria-selected="false" tabindex="-1">Dados</button>
+            <button class="aba-botao" data-aba="dashboards" type="button" role="tab" id="aba-botao-dashboards" aria-controls="aba-dashboards" aria-selected="false" tabindex="-1">Dashboards</button>
+            <button class="aba-botao" data-aba="erros" type="button" role="tab" id="aba-botao-erros" aria-controls="aba-erros" aria-selected="false" tabindex="-1">Erros</button>
         </nav>
     </header>
 
     <main>
         <!-- ================= ABA: PROCESSAR ================= -->
-        <div id="aba-processar" class="aba">
+        <div id="aba-processar" class="aba" role="tabpanel" aria-labelledby="aba-botao-processar">
             <section id="banner-status" class="banner" hidden></section>
 
             <section id="area-upload" class="cartao">
                 <h2>1. Selecionar faturas</h2>
                 <div id="zona-drop" class="zona-drop">
                     <p>Arraste PDFs (ou uma pasta) aqui, ou use os botões abaixo.</p>
+                    <p class="dica-upload">Prefira <strong>Selecionar pasta</strong>: o nome da pasta ajuda a identificar a distribuidora quando o nome do arquivo não diz qual é.</p>
                     <div class="botoes-upload">
                         <label class="botao secundario">
                             Selecionar arquivos
-                            <input id="input-arquivos" type="file" accept="application/pdf" multiple hidden>
+                            <input id="input-arquivos" class="sr-only" type="file" accept="application/pdf" multiple>
                         </label>
                         <label class="botao secundario">
                             Selecionar pasta
-                            <input id="input-pasta" type="file" webkitdirectory directory multiple hidden>
+                            <input id="input-pasta" class="sr-only" type="file" webkitdirectory directory multiple>
                         </label>
                     </div>
                 </div>
+
+                <p id="status-upload" class="status-inline" role="status" aria-live="polite" hidden></p>
 
                 <div id="lista-selecionados" class="lista-arquivos" hidden>
                     <h3>Arquivos selecionados (<span id="contagem-selecionados">0</span>)</h3>
@@ -84,7 +87,7 @@
         </div>
 
         <!-- ================= ABA: DADOS ================= -->
-        <div id="aba-dados" class="aba" hidden>
+        <div id="aba-dados" class="aba" role="tabpanel" aria-labelledby="aba-botao-dados" hidden>
             <section class="cartao">
                 <div class="filtros-dados">
                     <label class="campo-filtro">
@@ -94,6 +97,10 @@
                     <label class="campo-filtro campo-busca">
                         Buscar (cliente, conta, fatura, arquivo)
                         <input id="input-busca-dados" type="search" placeholder="ex.: Fórum de Anápolis">
+                    </label>
+                    <label class="campo-checkbox">
+                        <input id="check-somente-suspeitas" type="checkbox">
+                        Somente suspeitas
                     </label>
                     <a id="link-baixar-csv" class="botao secundario" href="#" target="_blank" rel="noopener">Baixar CSV completo</a>
                 </div>
@@ -115,8 +122,8 @@
                                 <th>SMRSU</th>
                                 <th>Outras taxas</th>
                                 <th>Total</th>
-                                <th></th>
-                                <th></th>
+                                <th><span class="sr-only">Situação</span></th>
+                                <th><span class="sr-only">Ações</span></th>
                             </tr>
                         </thead>
                         <tbody id="tbody-dados"></tbody>
@@ -132,7 +139,7 @@
         </div>
 
         <!-- ================= ABA: DASHBOARDS ================= -->
-        <div id="aba-dashboards" class="aba" hidden>
+        <div id="aba-dashboards" class="aba" role="tabpanel" aria-labelledby="aba-botao-dashboards" hidden>
             <section class="linha-kpis">
                 <div class="stat-tile">
                     <span class="stat-label">Total de faturas</span>
@@ -205,14 +212,16 @@
         </div>
 
         <!-- ================= ABA: ERROS ================= -->
-        <div id="aba-erros" class="aba" hidden>
+        <div id="aba-erros" class="aba" role="tabpanel" aria-labelledby="aba-botao-erros" hidden>
             <section id="form-erro" class="cartao">
                 <h2>Reportar um erro</h2>
-                <p class="texto-progresso">Achou uma fatura com valor errado, campo faltando ou qualquer outra coisa estranha? Descreva aqui.</p>
+                <p class="texto-progresso">Achou uma fatura com valor errado, campo faltando ou qualquer outra coisa estranha? Descreva aqui. Dica: o botão "Reportar erro" em cada linha da aba Dados já preenche a fatura pra você.</p>
                 <div class="grade-form-erro">
                     <label class="campo-filtro">
                         Distribuidora
-                        <input id="erro-concessionaria" type="text" placeholder="ex.: SAAE_CORUMBA">
+                        <select id="erro-concessionaria">
+                            <option value="">Não sei / outra</option>
+                        </select>
                     </label>
                     <label class="campo-filtro">
                         Fatura
@@ -228,13 +237,13 @@
                     </label>
                 </div>
                 <label class="campo-filtro campo-mensagem-erro">
-                    O que está errado?
-                    <textarea id="erro-mensagem" rows="3" placeholder="ex.: Valor total não bate com o que está no PDF original."></textarea>
+                    O que está errado? (obrigatório)
+                    <textarea id="erro-mensagem" rows="3" required aria-required="true" placeholder="ex.: Valor total não bate com o que está no PDF original."></textarea>
                 </label>
                 <div class="acoes">
                     <button id="botao-enviar-erro" class="botao primario" type="button">Enviar reporte</button>
                 </div>
-                <p id="erro-form-status" class="texto-progresso" hidden></p>
+                <p id="erro-form-status" class="texto-progresso" role="status" aria-live="polite" hidden></p>
             </section>
 
             <section class="cartao">
@@ -263,7 +272,7 @@
                                 <th>Mês/Ano</th>
                                 <th>Mensagem</th>
                                 <th>Status</th>
-                                <th></th>
+                                <th><span class="sr-only">Ações</span></th>
                             </tr>
                         </thead>
                         <tbody id="tbody-erros"></tbody>

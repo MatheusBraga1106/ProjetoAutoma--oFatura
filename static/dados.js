@@ -13,6 +13,8 @@
     const botaoAnterior = document.getElementById("botao-pagina-anterior");
     const botaoProxima = document.getElementById("botao-pagina-proxima");
     const textoPaginacao = document.getElementById("texto-paginacao");
+    const checkSuspeitas = document.getElementById("check-somente-suspeitas");
+    let requisicaoAtual = 0;
 
     const TAMANHO_PAGINA = 50;
 
@@ -62,9 +64,22 @@
             tamanho_pagina: String(TAMANHO_PAGINA),
             busca: inputBusca.value.trim(),
         });
+        if (checkSuspeitas.checked) parametros.set("somente_suspeitas", "1");
 
-        const resposta = await fetch(`/dados/${encodeURIComponent(empresaAtual)}?${parametros}`);
-        if (!resposta.ok) {
+        // Mantém a tabela anterior esmaecida enquanto busca, e ignora
+        // respostas que chegarem fora de ordem (busca digitada rápido).
+        const id = ++requisicaoAtual;
+        tabelaScroll.classList.add("carregando");
+        let resposta = null;
+        try {
+            resposta = await fetch(`/dados/${encodeURIComponent(empresaAtual)}?${parametros}`);
+        } catch (erro) {
+            resposta = null;
+        } finally {
+            if (id === requisicaoAtual) tabelaScroll.classList.remove("carregando");
+        }
+        if (id !== requisicaoAtual) return;
+        if (!resposta || !resposta.ok) {
             tbody.innerHTML = "";
             textoVazio.hidden = false;
             textoVazio.textContent = "Não foi possível carregar os dados dessa distribuidora.";
@@ -72,6 +87,10 @@
         }
 
         const dados = await resposta.json();
+        if (id !== requisicaoAtual) return;
+        textoVazio.textContent = checkSuspeitas.checked
+            ? "Nenhuma fatura suspeita encontrada."
+            : "Nenhuma fatura encontrada.";
         totalAtual = dados.total;
         renderizarTabela(dados.linhas);
         renderizarPaginacao();
@@ -111,6 +130,10 @@
             botaoReportar.className = "botao secundario botao-reportar-erro";
             botaoReportar.type = "button";
             botaoReportar.textContent = "Reportar erro";
+            botaoReportar.setAttribute(
+                "aria-label",
+                `Reportar erro na fatura ${linha.NUM_FATURA || "sem número"}, conta ${linha.CONTA_DV || "—"}, ${linha.MES_ANO_REF || "mês desconhecido"}`
+            );
             botaoReportar.addEventListener("click", () => reportarErro(linha));
             tdReportar.appendChild(botaoReportar);
             tr.appendChild(tdReportar);
@@ -127,19 +150,23 @@
     }
 
     function reportarErro(linha) {
+        // Troca de aba antes de preencher: o foco no campo de mensagem só
+        // funciona com o painel da aba Erros já visível.
+        document.querySelector('.aba-botao[data-aba="erros"]').click();
         window.Erros.preencher({
             concessionaria: empresaAtual,
             numFatura: linha.NUM_FATURA,
             contaDv: linha.CONTA_DV,
             mesAno: linha.MES_ANO_REF,
         });
-        document.querySelector('.aba-botao[data-aba="erros"]').click();
     }
 
     selectEmpresa.addEventListener("change", () => {
         empresaAtual = selectEmpresa.value;
         carregarPagina(1);
     });
+
+    checkSuspeitas.addEventListener("change", () => carregarPagina(1));
 
     inputBusca.addEventListener("input", () => {
         clearTimeout(buscaDebounce);
