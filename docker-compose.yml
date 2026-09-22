@@ -1,0 +1,227 @@
+# Stack do extrator de faturas de água para o Dokploy (tipo "Docker Compose").
+# Decisões e alternativas: docs/decisao-armazenamento.md
+# Passo a passo de deploy:  docs/deploy-dokploy.md
+#
+# Serviços (todos com nome prefixado "faturas-" de propósito: a app também
+# entra na rede compartilhada dokploy-network, onde outros projetos da VPS
+# podem ter um serviço chamado "db" ou "minio" — nome genérico ali pode
+# resolver pro container de OUTRO projeto):
+#   faturas-db            Postgres 17 dedicado (NÃO é o do neon-balance-glow)
+#   faturas-storage       S3 self-hosted (Silo = fork mantido do MinIO)
+#   faturas-storage-init  one-shot: cria bucket + usuário S3 restrito (idempotente)
+#   faturas-migrar        one-shot: python -m banco.migrar (idempotente)
+#   faturas-app           UI + API (uvicorn) — ÚNICO serviço exposto, via domínio do Dokploy
+#   faturas-worker        python worker.py (fila = tabela jobs no Postgres)
+#
+# Só faturas-app está na dokploy-network (é por ela que o Traefik chega).
+# Banco e storage ficam só na rede "interno" (internal: true = sem saída
+# pra internet e inalcançável por outros projetos). Nenhum "ports:".
+#
+# Variáveis: vêm do .env que o Dokploy gera a partir da aba Environment
+# (modelo em .env.example). As obrigatórias usam ${VAR:?...} pra o deploy
+# falhar com mensagem clara em vez de subir com senha vazia.
+
+x-imagem-extrator: &imagem-extrator
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: faturas-extrator:local
+  environment:
+    # Contrato fixo entre app/worker/migração (não renomear):
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?defina POSTGRES_USER}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}@faturas-db:5432/${POSTGRES_DB:?defina POSTGRES_DB}
+    S3_ENDPOINT_URL: http://faturas-storage:9000
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:?defina S3_ACCESS_KEY}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:?defina S3_SECRET_KEY}
+    S3_BUCKET: ${S3_BUCKET:-faturas-agua}
+    S3_REGION: ${S3_REGION:-us-east-1}
+    # /app/contas.json de propósito: extratores/saneago.py ainda lê
+    # "contas.json" relativo ao diretório de trabalho (/app). Montando aqui,
+    # o caminho explícito e o implícito apontam pro mesmo arquivo.
+    CONTAS_JSON_PATH: /app/contas.json
+    PORT: ${PORT:-8000}
+    TESSERACT_CMD: ${TESSERACT_CMD:-}
+  volumes:
+    # File Mount do Dokploy (Advanced -> Mounts -> File Mount "contas.json").
+    # Criar ANTES do primeiro deploy: se não existir, o Docker cria um
+    # DIRETÓRIO vazio com esse nome e a leitura do JSON quebra.
+    - ../files/contas.json:/app/contas.json:ro
+  networks:
+    - interno
+  logging: &logging
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  faturas-db:
+    image: postgres:17-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?defina POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?defina POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    volumes:
+      - faturas-db-dados:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    networks:
+      - interno
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    logging: *logging
+
+  faturas-storage:
+    # MinIO oficial não serve mais: repositório arquivado (fev/2026) e a
+    # imagem minio/minio saiu do Docker Hub (set/2026). Silo é o fork
+    # mantido pela Pigsty, compatível no protocolo S3, nas variáveis
+    # MINIO_* e no formato de dados. Tag FIXADA — atualizar só lendo o
+    # release notes. Ver docs/decisao-armazenamento.md.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_ROOT_USER:?defina STORAGE_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${STORAGE_ROOT_PASSWORD:?defina STORAGE_ROOT_PASSWORD}
+    volumes:
+      - faturas-storage-dados:/data
+    expose:
+      - "9000"   # API S3 (só rede interna)
+      - "9001"   # console web (só rede interna; acesso via túnel SSH)
+    networks:
+      - interno
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    logging: *logging
+
+  faturas-storage-init:
+    # One-shot idempotente: garante bucket + política restrita a ele +
+    # usuário da app (S3_ACCESS_KEY/S3_SECRET_KEY). App e worker NUNCA
+    # recebem a credencial root. "$$" = variável resolvida pelo shell do
+    # container, não pelo compose.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    restart: "no"
+    depends_on:
+      faturas-storage:
+        condition: service_healthy
+    environment:
+      STORAGE_ROOT_USER: ${STORAGE_ROOT_USER:?defina STORAGE_ROOT_USER}
+      STORAGE_ROOT_PASSWORD: ${STORAGE_ROOT_PASSWORD:?defina STORAGE_ROOT_PASSWORD}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?defina S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?defina S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET:-faturas-agua}
+      MC_CONFIG_DIR: /tmp/.mc
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mcli alias set raiz http://faturas-storage:9000 "$$STORAGE_ROOT_USER" "$$STORAGE_ROOT_PASSWORD"
+        mcli mb --ignore-existing "raiz/$$S3_BUCKET"
+        printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListAllMyBuckets"],"Resource":["arn:aws:s3:::*"]},{"Effect":"Allow","Action":["s3:GetBucketLocation","s3:ListBucket","s3:ListBucketMultipartUploads"],"Resource":["arn:aws:s3:::'"$$S3_BUCKET"'"]},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":["arn:aws:s3:::'"$$S3_BUCKET"'/*"]}]}' > /tmp/politica.json
+        mcli admin policy create raiz faturas-app-rw /tmp/politica.json
+        mcli admin user add raiz "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"
+        mcli admin policy attach raiz faturas-app-rw --user "$$S3_ACCESS_KEY" 2>/dev/null || echo "politica ja estava anexada"
+        mcli admin user info raiz "$$S3_ACCESS_KEY"
+        echo "storage pronto: bucket $$S3_BUCKET, usuario $$S3_ACCESS_KEY"
+    networks:
+      - interno
+    logging: *logging
+
+  faturas-migrar:
+    <<: *imagem-extrator
+    restart: "no"
+    command: ["python", "-m", "banco.migrar"]
+    depends_on:
+      faturas-db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  faturas-app:
+    <<: *imagem-extrator
+    restart: unless-stopped
+    # Sem "command": usa o CMD do Dockerfile
+    # (uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}) e o HEALTHCHECK de lá (/health).
+    depends_on:
+      faturas-migrar:
+        condition: service_completed_successfully
+      faturas-storage-init:
+        condition: service_completed_successfully
+      faturas-db:
+        condition: service_healthy
+      faturas-storage:
+        condition: service_healthy
+    expose:
+      - "8000"
+    networks:
+      - interno
+      - dokploy-network
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  faturas-worker:
+    <<: *imagem-extrator
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    # Dá tempo do worker terminar/devolver o arquivo atual ao receber SIGTERM
+    # num redeploy (OCR de uma página a 400 DPI leva segundos).
+    stop_grace_period: 60s
+    depends_on:
+      faturas-migrar:
+        condition: service_completed_successfully
+      faturas-storage-init:
+        condition: service_completed_successfully
+      faturas-db:
+        condition: service_healthy
+      faturas-storage:
+        condition: service_healthy
+    # Worker não serve HTTP: o healthcheck confere que Tesseract (com "por")
+    # e o Postgres respondem de dentro do container.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sqlalchemy as sa,pytesseract; assert 'por' in pytesseract.get_languages(config=''); sa.create_engine(os.environ['DATABASE_URL']).connect().close()"
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    # Teto de proteção pros vizinhos da VPS (FindBus, neon-balance-glow,
+    # Toca) — não é tuning: o OCR sozinho pode ocupar todos os núcleos.
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4g
+
+volumes:
+  # No Dokploy o nome real fica "<appName>_faturas-db-dados" etc. — é esse
+  # nome que vai na tela de Volume Backups / restore.
+  faturas-db-dados:
+  faturas-storage-dados:
+
+networks:
+  interno:
+    internal: true
+  dokploy-network:
+    external: true

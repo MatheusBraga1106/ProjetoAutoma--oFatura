@@ -1,6 +1,7 @@
 import os
 import io
 import glob
+import shutil
 
 import pymupdf
 import pytesseract
@@ -23,18 +24,26 @@ IDIOMA_PADRAO = "por"
 
 
 def localizar_tesseract():
-    """Acha o executável do tesseract. Tenta o PATH primeiro; se não
-    achar, cai no caminho padrão de instalação via winget/instalador
-    oficial no Windows."""
-    candidatos = [
-        "tesseract",
-        r"C:\Users\matheusdias\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    ]
-    for c in candidatos:
-        if os.path.isabs(c) and os.path.exists(c):
-            return c
-    return candidatos[0]  # deixa o pytesseract tentar resolver via PATH
+    """Acha o executável do tesseract, nesta ordem:
+    1. env TESSERACT_CMD (caminho explícito, se quem faz o deploy quiser fixar);
+    2. PATH (é o caso do container Linux: /usr/bin/tesseract via apt);
+    3. só no Windows, os caminhos padrão do winget/instalador oficial.
+    Se nada disso achar, devolve "tesseract" e deixa o pytesseract falhar
+    com a mensagem dele (a UI mostra isso no banner de status)."""
+    explicito = os.environ.get("TESSERACT_CMD", "").strip()
+    if explicito:
+        return explicito
+    no_path = shutil.which("tesseract")
+    if no_path:
+        return no_path
+    if os.name == "nt":
+        for c in (
+            r"C:\Users\matheusdias\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        ):
+            if os.path.exists(c):
+                return c
+    return "tesseract"
 
 
 pytesseract.pytesseract.tesseract_cmd = localizar_tesseract()

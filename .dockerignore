@@ -1,10 +1,39 @@
+# Nada de dado real dentro da imagem: faturas, saídas, cadastro de contas e
+# bancos locais entram em produção por storage S3 / Postgres / File Mount
+# do Dokploy (ver docs/deploy-dokploy.md), nunca pelo build.
 dados_entrada/
 dados_saida/
+dados_saida_backup*/
 contas.json
 contasAntigo.json
 *.faturas.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Segredos locais
+.env
+.env.*
+!.env.example
+
+# Python / ferramentas
 __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
+tests/
+uvicorn_out.log
+uvicorn_err.log
+*.log
+
+# Repositório / editor / docs (não são usados em runtime)
 .git/
+.gitignore
+.claude/
+.vscode/
+.idea/
+docs/
+Dockerfile
+docker-compose.yml
+.dockerignore
