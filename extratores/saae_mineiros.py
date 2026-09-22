@@ -77,7 +77,9 @@ def extrair_saae_mineiros(caminho_txt):
         esgoto_f = formatar_para_sql(match_esgoto.group(1)) if match_esgoto else 0.0
 
         # (-) Valor do Pagamento \n R$ 843,20 (A mesma regra robusta que criámos antes)
-        match_total = re.search(r'\(-\)\s*Valor do Pagamento\s*R\$\s*([\d\.,]+)', pagina_texto, re.IGNORECASE)
+        # Em faturas via OCR o Tesseract às vezes lê o "-" como "=" dentro
+        # dos parênteses ("(=) Valor do Pagamento") — aceita os dois.
+        match_total = re.search(r'\([-=]\)\s*Valor do Pagamento\s*R\$\s*([\d\.,]+)', pagina_texto, re.IGNORECASE)
         total_f = formatar_para_sql(match_total.group(1)) if match_total else 0.0
 
         taxas_extras_f = round(total_f - agua_f - esgoto_f, 2)
