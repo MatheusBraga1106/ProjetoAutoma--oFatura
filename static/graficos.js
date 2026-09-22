@@ -61,6 +61,13 @@
         return String(texto).length * tamanhoFonte * 0.56;
     }
 
+    let contextoMedicao = null;
+    function medirTexto(texto, tamanhoFonte, referencia) {
+        contextoMedicao = contextoMedicao || document.createElement("canvas").getContext("2d");
+        contextoMedicao.font = `${tamanhoFonte}px ${getComputedStyle(referencia).fontFamily}`;
+        return contextoMedicao.measureText(String(texto)).width;
+    }
+
     function estadoVazio(container, mensagem) {
         container.innerHTML = "";
         const p = document.createElement("p");
@@ -88,6 +95,17 @@
             topo: 24, direita: 16, baixo: 70,
             esquerda: Math.max(16, larguraEstimada(formatar(valorMaximo), 10) + 10),
         };
+        // Rótulos de categoria inclinados (-40°, ancorados pelo fim) avançam
+        // ~cos(40°) da largura do texto pra esquerda do centro da 1ª barra —
+        // com eixo Y curto (ex.: "40") a margem padrão não comporta e corta.
+        const bandaAproximada = (largura - margem.esquerda - margem.direita) / dados.length;
+        if (bandaAproximada < 90) {
+            // Mede de verdade: a estimativa por caractere subestima maiúsculas.
+            const angulo = 40 * Math.PI / 180;
+            const larguraTexto = medirTexto(dados[0].rotulo, 10, container);
+            const avancoPrimeiro = Math.cos(angulo) * larguraTexto + Math.sin(angulo) * 10;
+            margem.esquerda = Math.max(margem.esquerda, avancoPrimeiro - bandaAproximada / 2 + 4);
+        }
         const areaLargura = largura - margem.esquerda - margem.direita;
         const areaAltura = altura - margem.topo - margem.baixo;
 
@@ -264,20 +282,33 @@
         // primeiro e o último ponto), pulando qualquer um que ficaria perto
         // demais do último já desenhado — nunca deixa colidir.
         const larguraRotuloX = larguraEstimada("00/0000", 10);
-        let xUltimoRotulo = -Infinity;
+        const folgaRotulos = 8;
+        // Centralizado corta nas bordas (o 1º ponto fica colado na margem
+        // esquerda) — ancora pelo lado que cabe e mede a colisão pela borda
+        // real de cada rótulo, não pelo centro.
+        const ancoraPara = (x) => {
+            if (x - larguraRotuloX / 2 < 0) return "start";
+            if (x + larguraRotuloX / 2 > largura) return "end";
+            return "middle";
+        };
+        const esquerdaDo = (x, ancora) =>
+            ancora === "start" ? x : ancora === "end" ? x - larguraRotuloX : x - larguraRotuloX / 2;
+        let direitaUltimoRotulo = -Infinity;
         const passoAlvo = Math.max(1, Math.round((larguraRotuloX + 12) / passoX));
         for (let i = 0; i < pontos.length; i += passoAlvo) {
             const p = pontos[i];
-            if (p.x - xUltimoRotulo < larguraRotuloX + 8 && i !== 0) continue;
+            const ancora = ancoraPara(p.x);
+            const esquerda = esquerdaDo(p.x, ancora);
+            if (i !== 0 && esquerda < direitaUltimoRotulo + folgaRotulos) continue;
             const rotulo = textoSvg(p.x, altura - 8, p.rotulo, "grafico-rotulo-eixo");
             rotulo.setAttribute("fill", ink);
-            rotulo.setAttribute("text-anchor", "middle");
+            rotulo.setAttribute("text-anchor", ancora);
             svg.appendChild(rotulo);
-            xUltimoRotulo = p.x;
+            direitaUltimoRotulo = esquerda + larguraRotuloX;
         }
-        // Último ponto: só rotula se não colidir com o rótulo anterior.
+        // Último ponto (ancorado pelo fim): só rotula se não colidir.
         const ultimoPonto = pontos[pontos.length - 1];
-        if (ultimoPonto.x - xUltimoRotulo >= larguraRotuloX + 8) {
+        if (ultimoPonto.x - larguraRotuloX >= direitaUltimoRotulo + folgaRotulos) {
             const rotulo = textoSvg(ultimoPonto.x, altura - 8, ultimoPonto.rotulo, "grafico-rotulo-eixo");
             rotulo.setAttribute("fill", ink);
             rotulo.setAttribute("text-anchor", "end");

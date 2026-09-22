@@ -163,33 +163,45 @@
                 </figure>
             </section>
 
+            <section class="filtros-dashboard">
+                <h2 class="titulo-secao-dashboard">Evolução mensal e rankings</h2>
+                <label class="campo-filtro">
+                    Distribuidora
+                    <select id="select-empresa-dashboard">
+                        <option value="">Todas</option>
+                    </select>
+                </label>
+            </section>
+
+            <div id="detalhe-dashboard" class="detalhe-dashboard">
             <section class="grade-graficos">
                 <figure class="cartao cartao-grafico">
-                    <figcaption>Valor total por mês (R$)</figcaption>
+                    <figcaption id="titulo-grafico-valor-mensal">Valor total por mês (R$)</figcaption>
                     <div id="grafico-valor-mensal" class="area-grafico"></div>
                 </figure>
                 <figure class="cartao cartao-grafico">
-                    <figcaption>Consumo total por mês (m³)</figcaption>
+                    <figcaption id="titulo-grafico-consumo-mensal">Consumo total por mês (m³)</figcaption>
                     <div id="grafico-consumo-mensal" class="area-grafico"></div>
                 </figure>
             </section>
 
             <section class="grade-tabelas">
                 <div class="cartao">
-                    <h3>Maiores consumos</h3>
+                    <h3 id="titulo-top-consumo">Maiores consumos</h3>
                     <table class="tabela">
                         <thead><tr><th>Distribuidora</th><th>Cliente</th><th>Mês/Ano</th><th>Consumo (m³)</th></tr></thead>
                         <tbody id="tbody-top-consumo"></tbody>
                     </table>
                 </div>
                 <div class="cartao">
-                    <h3>Maiores valores</h3>
+                    <h3 id="titulo-top-valor">Maiores valores</h3>
                     <table class="tabela">
                         <thead><tr><th>Distribuidora</th><th>Cliente</th><th>Mês/Ano</th><th>Valor (R$)</th></tr></thead>
                         <tbody id="tbody-top-valor"></tbody>
                     </table>
                 </div>
             </section>
+            </div>
         </div>
 
         <!-- ================= ABA: ERROS ================= -->

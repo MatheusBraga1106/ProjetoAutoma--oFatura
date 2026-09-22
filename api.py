@@ -46,6 +46,17 @@ from erros_reportados import atualizar_status, criar_erro, inicializar_db, lista
 app = FastAPI(title="Extrator de Faturas de Água")
 inicializar_db()
 
+
+@app.middleware("http")
+async def estaticos_sempre_revalidados(request: Request, call_next):
+    # Sem Cache-Control o navegador aplica cache heurístico e segue servindo
+    # JS/CSS antigos depois de uma atualização. "no-cache" força revalidar
+    # (304 barato via ETag quando nada mudou).
+    resposta = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resposta.headers["Cache-Control"] = "no-cache"
+    return resposta
+
 DIRETORIO_APP = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(DIRETORIO_APP, "templates"))
 app.mount("/static", StaticFiles(directory=os.path.join(DIRETORIO_APP, "static")), name="static")
@@ -90,6 +101,14 @@ def _validar_empresa(empresa: str) -> str:
     if empresa_upper not in EMPRESAS_CONHECIDAS:
         raise HTTPException(status_code=404, detail="Empresa desconhecida.")
     return empresa_upper
+
+
+def _texto_ou_vazio(valor) -> str:
+    """`valor or ""` não pega NaN (é truthy em Python) — vira float('nan') no
+    dict e quebra o json.dumps da resposta ("Out of range float values are
+    not JSON compliant"). Usa isso pra qualquer campo de texto que pode vir
+    de uma linha de CSV com célula vazia."""
+    return "" if pd.isna(valor) else str(valor)
 
 
 def _caminho_csv_empresa(empresa: str) -> str:
@@ -501,9 +520,15 @@ def dados_empresa_csv(empresa: str):
 # =========================================================
 
 @app.get("/dashboard/resumo")
-def dashboard_resumo():
+def dashboard_resumo(empresa: "str | None" = None):
+    """KPIs e comparação por empresa sempre agregam todas as distribuidoras
+    (são gráficos de comparação — não faz sentido filtrar). Já a série
+    mensal e os "maiores consumos/valores" respeitam o filtro `empresa`,
+    quando informado (usado pelo seletor "Distribuidora" da aba
+    Dashboards, abaixo dos gráficos de comparação)."""
     saida = pasta_saida()
     empresas_info = listar_empresas_com_dados(saida)
+    empresa_filtro = _validar_empresa(empresa) if empresa else None
 
     kpis = {"total_faturas": 0, "valor_total": 0.0, "consumo_total": 0.0, "total_suspeitas": 0}
     por_empresa = []
@@ -533,9 +558,13 @@ def dashboard_resumo():
             "suspeitas": suspeitas_empresa,
         })
 
-        # Série mensal: soma por mês, acumulando entre todas as distribuidoras
-        # (uma série só no gráfico final — ver Contexto do plano sobre o teto
-        # de séries categóricas do skill dataviz).
+        # Série mensal e "maiores consumos/valores" respeitam o filtro por
+        # empresa (se não informado, acumula todas — uma série só no
+        # gráfico final, ver Contexto do plano sobre o teto de séries
+        # categóricas do skill dataviz).
+        if empresa_filtro is not None and empresa != empresa_filtro:
+            continue
+
         df_valido = df.copy()
         df_valido["_MES_ORD"] = pd.to_datetime(df_valido.get("MES_ANO_REF", ""), format="%m/%Y", errors="coerce")
         df_valido = df_valido.dropna(subset=["_MES_ORD"])
@@ -559,16 +588,16 @@ def dashboard_resumo():
             for _, linha in df.nlargest(10, "CONSUMO_M3").iterrows():
                 linhas_top_consumo.append({
                     "empresa": empresa,
-                    "cliente": linha.get("NOME_CLIENTE") or "",
-                    "mes_ano": linha.get("MES_ANO_REF") or "",
+                    "cliente": _texto_ou_vazio(linha.get("NOME_CLIENTE")),
+                    "mes_ano": _texto_ou_vazio(linha.get("MES_ANO_REF")),
                     "consumo": float(linha.get("CONSUMO_M3") or 0),
                 })
         if "VALOR_TOTAL" in df.columns:
             for _, linha in df.nlargest(10, "VALOR_TOTAL").iterrows():
                 linhas_top_valor.append({
                     "empresa": empresa,
-                    "cliente": linha.get("NOME_CLIENTE") or "",
-                    "mes_ano": linha.get("MES_ANO_REF") or "",
+                    "cliente": _texto_ou_vazio(linha.get("NOME_CLIENTE")),
+                    "mes_ano": _texto_ou_vazio(linha.get("MES_ANO_REF")),
                     "valor": float(linha.get("VALOR_TOTAL") or 0),
                 })
 

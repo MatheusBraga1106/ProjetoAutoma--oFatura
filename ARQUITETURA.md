@@ -100,7 +100,7 @@ Serve a UI (`GET /`, `templates/index.html` + `static/`) e expõe:
 | `GET /dados/empresas` | Lista distribuidoras com CSV em `dados_saida/` + contagem de linhas |
 | `GET /dados/{empresa}` | Linhas paginadas (`pagina`, `tamanho_pagina`) + busca (`busca`) de uma distribuidora |
 | `GET /dados/{empresa}/csv` | Baixa o CSV consolidado daquela distribuidora |
-| `GET /dashboard/resumo` | Agregados pra aba Dashboards: KPIs, valor/suspeitas por empresa, série mensal, top 10 consumo/valor |
+| `GET /dashboard/resumo` | Agregados pra aba Dashboards: KPIs, valor/suspeitas por empresa, série mensal, top 10 consumo/valor. `?empresa=X` filtra só a série mensal e os top 10 (KPIs e comparação por empresa continuam globais) |
 | `GET /erros`, `POST /erros`, `PATCH /erros/{id}` | Fila de erros reportados pela aba Erros (listar/criar/marcar resolvido) — ver `erros_reportados.py` |
 
 Jobs (`/pipeline/jobs/*`) ficam em memória do processo (`dict` global `JOBS` em `api.py`) — não sobrevive a um restart do servidor nem escala pra múltiplas instâncias. Suficiente pro volume atual (uso único, poucas centenas de PDFs por lote).
