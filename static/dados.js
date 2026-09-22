@@ -106,6 +106,15 @@
             }
             tr.appendChild(tdSuspeita);
 
+            const tdReportar = document.createElement("td");
+            const botaoReportar = document.createElement("button");
+            botaoReportar.className = "botao secundario botao-reportar-erro";
+            botaoReportar.type = "button";
+            botaoReportar.textContent = "Reportar erro";
+            botaoReportar.addEventListener("click", () => reportarErro(linha));
+            tdReportar.appendChild(botaoReportar);
+            tr.appendChild(tdReportar);
+
             tbody.appendChild(tr);
         }
     }
@@ -115,6 +124,16 @@
         textoPaginacao.textContent = `Página ${paginaAtual} de ${totalPaginas} — ${totalAtual} fatura(s)`;
         botaoAnterior.disabled = paginaAtual <= 1;
         botaoProxima.disabled = paginaAtual >= totalPaginas;
+    }
+
+    function reportarErro(linha) {
+        window.Erros.preencher({
+            concessionaria: empresaAtual,
+            numFatura: linha.NUM_FATURA,
+            contaDv: linha.CONTA_DV,
+            mesAno: linha.MES_ANO_REF,
+        });
+        document.querySelector('.aba-botao[data-aba="erros"]').click();
     }
 
     selectEmpresa.addEventListener("change", () => {

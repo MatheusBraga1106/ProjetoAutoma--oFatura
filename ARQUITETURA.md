@@ -43,13 +43,15 @@ Os dois **compartilham a mesma lógica de negócio** através de `pipeline.py`. 
 │   ├── pdftotext_fallback.py  # 1ª tentativa: pdftotext (rápido)
 │   └── ocr_fallback.py        # 2ª tentativa: OCR via Tesseract (PDF-imagem)
 ├── templates/
-│   └── index.html            # Página única da UI (3 abas)
+│   └── index.html            # Página única da UI (4 abas)
 ├── static/
 │   ├── app.js                 # Upload, progresso (SSE), troca de abas
 │   ├── dados.js                # Aba "Dados"
 │   ├── dashboard.js            # Aba "Dashboards"
+│   ├── erros.js                 # Aba "Erros"
 │   ├── graficos.js             # Gráficos SVG reutilizáveis (barra/linha)
 │   └── estilo.css              # Tema claro/escuro, tokens de gráfico
+├── erros_reportados.py        # Banco SQLite da aba Erros (erros_reportados.db, NÃO versionado)
 ├── contas.json                # Cadastro de contas (dados reais — NÃO versionado)
 ├── contas.exemplo.json        # Mesma estrutura, com dados fictícios
 ├── dados_entrada/              # PDFs de entrada (NÃO versionado)
@@ -99,6 +101,7 @@ Serve a UI (`GET /`, `templates/index.html` + `static/`) e expõe:
 | `GET /dados/{empresa}` | Linhas paginadas (`pagina`, `tamanho_pagina`) + busca (`busca`) de uma distribuidora |
 | `GET /dados/{empresa}/csv` | Baixa o CSV consolidado daquela distribuidora |
 | `GET /dashboard/resumo` | Agregados pra aba Dashboards: KPIs, valor/suspeitas por empresa, série mensal, top 10 consumo/valor |
+| `GET /erros`, `POST /erros`, `PATCH /erros/{id}` | Fila de erros reportados pela aba Erros (listar/criar/marcar resolvido) — ver `erros_reportados.py` |
 
 Jobs (`/pipeline/jobs/*`) ficam em memória do processo (`dict` global `JOBS` em `api.py`) — não sobrevive a um restart do servidor nem escala pra múltiplas instâncias. Suficiente pro volume atual (uso único, poucas centenas de PDFs por lote).
 
@@ -106,11 +109,12 @@ A pasta de saída é configurável via env var `DADOS_SAIDA_DIR` (default: `dado
 
 ## A interface web (`templates/` + `static/`)
 
-Uma página só (`index.html`), sem build step (JS vanilla direto, sem bundler/framework), com três abas trocadas via `static/app.js` (mostra/esconde `<div class="aba">`, sem recarregar a página):
+Uma página só (`index.html`), sem build step (JS vanilla direto, sem bundler/framework), com quatro abas trocadas via `static/app.js` (mostra/esconde `<div class="aba">`, sem recarregar a página):
 
 - **Processar** — upload (arraste PDFs, ou selecione uma pasta inteira via `webkitdirectory`, replicando o walk de pastas do `Main.py`), progresso ao vivo consumindo o SSE de `/pipeline/jobs/{id}/eventos`, e o resumo do lote ao final.
-- **Dados** (`static/dados.js`) — navega os CSVs já consolidados, por distribuidora, com busca e paginação (server-side — a SANEAGO sozinha passa de 8 mil linhas).
+- **Dados** (`static/dados.js`) — navega os CSVs já consolidados, por distribuidora, com busca e paginação (server-side — a SANEAGO sozinha passa de 8 mil linhas). Cada linha tem um botão "Reportar erro" que troca pra aba Erros com a fatura já pré-preenchida.
 - **Dashboards** (`static/dashboard.js` + `static/graficos.js`) — KPIs, comparação entre distribuidoras e evolução mensal. Os gráficos são SVG puro desenhado à mão (sem lib externa), seguindo as regras do skill de *dataviz* do projeto: hue sequencial único pra comparar magnitude (nunca uma cor por distribuidora), gráficos de linha de uma métrica só (nunca dois eixos Y), rótulo que só aparece quando cabe (senão vai pro tooltip).
+- **Erros** (`static/erros.js`) — formulário pra reportar um problema numa fatura (distribuidora/fatura/conta/mês-ano + mensagem livre) e a lista dos já reportados, com filtro por status e botão pra marcar resolvido/reabrir. Persistido em `erros_reportados.py` (SQLite local, `erros_reportados.db` — gitignored, mesmo padrão do `hub.db` do projeto irmão `hub-faturas`, sem precisar de Docker/Postgres pra rodar). Não altera nada em `dados_saida/`; é só uma fila de revisão manual.
 
 `static/estilo.css` define os tokens de cor (claro/escuro via `prefers-color-scheme`) usados tanto pela UI quanto pelos gráficos (`--serie-1` é o azul de referência do skill de dataviz, separado do `--cor-primaria` usado nos botões).
 

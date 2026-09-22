@@ -329,3 +329,39 @@ main > .aba[hidden] { display: none; }
 }
 .grafico-tooltip div:first-child { opacity: 0.8; }
 .grafico-tooltip div:last-child { font-weight: 700; }
+
+/* ================= ABA: ERROS ================= */
+
+.grade-form-erro {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1rem;
+}
+
+.campo-mensagem-erro { margin-bottom: 1rem; }
+
+.campo-filtro textarea {
+    font: inherit;
+    font-weight: 400;
+    color: var(--cor-texto);
+    background: var(--cor-fundo);
+    border: 1px solid var(--cor-borda);
+    border-radius: 8px;
+    padding: 0.5rem 0.6rem;
+    resize: vertical;
+}
+
+.erro-form-ok { color: var(--cor-sucesso); font-weight: 600; }
+.erro-form-erro { color: var(--cor-erro); font-weight: 600; }
+
+.badge-resolvido {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--cor-sucesso);
+}
+
+.botao-reportar-erro { font-size: 0.78rem; padding: 0.35rem 0.6rem; }

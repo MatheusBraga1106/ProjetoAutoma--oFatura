@@ -14,6 +14,7 @@
             <button class="aba-botao ativo" data-aba="processar" type="button">Processar</button>
             <button class="aba-botao" data-aba="dados" type="button">Dados</button>
             <button class="aba-botao" data-aba="dashboards" type="button">Dashboards</button>
+            <button class="aba-botao" data-aba="erros" type="button">Erros</button>
         </nav>
     </header>
 
@@ -115,6 +116,7 @@
                                 <th>Outras taxas</th>
                                 <th>Total</th>
                                 <th></th>
+                                <th></th>
                             </tr>
                         </thead>
                         <tbody id="tbody-dados"></tbody>
@@ -189,11 +191,80 @@
                 </div>
             </section>
         </div>
+
+        <!-- ================= ABA: ERROS ================= -->
+        <div id="aba-erros" class="aba" hidden>
+            <section id="form-erro" class="cartao">
+                <h2>Reportar um erro</h2>
+                <p class="texto-progresso">Achou uma fatura com valor errado, campo faltando ou qualquer outra coisa estranha? Descreva aqui.</p>
+                <div class="grade-form-erro">
+                    <label class="campo-filtro">
+                        Distribuidora
+                        <input id="erro-concessionaria" type="text" placeholder="ex.: SAAE_CORUMBA">
+                    </label>
+                    <label class="campo-filtro">
+                        Fatura
+                        <input id="erro-num-fatura" type="text" placeholder="ex.: 637542">
+                    </label>
+                    <label class="campo-filtro">
+                        Conta
+                        <input id="erro-conta-dv" type="text" placeholder="ex.: 2338">
+                    </label>
+                    <label class="campo-filtro">
+                        Mês/Ano
+                        <input id="erro-mes-ano" type="text" placeholder="ex.: 09/2022">
+                    </label>
+                </div>
+                <label class="campo-filtro campo-mensagem-erro">
+                    O que está errado?
+                    <textarea id="erro-mensagem" rows="3" placeholder="ex.: Valor total não bate com o que está no PDF original."></textarea>
+                </label>
+                <div class="acoes">
+                    <button id="botao-enviar-erro" class="botao primario" type="button">Enviar reporte</button>
+                </div>
+                <p id="erro-form-status" class="texto-progresso" hidden></p>
+            </section>
+
+            <section class="cartao">
+                <div class="filtros-dados">
+                    <h2 style="margin: 0;">Erros reportados</h2>
+                    <label class="campo-filtro">
+                        Status
+                        <select id="select-status-erro">
+                            <option value="aberto" selected>Abertos</option>
+                            <option value="resolvido">Resolvidos</option>
+                            <option value="">Todos</option>
+                        </select>
+                    </label>
+                </div>
+
+                <p id="texto-vazio-erros" class="texto-progresso" hidden>Nenhum erro reportado com esse filtro.</p>
+
+                <div class="tabela-scroll">
+                    <table id="tabela-erros" class="tabela">
+                        <thead>
+                            <tr>
+                                <th>Quando</th>
+                                <th>Distribuidora</th>
+                                <th>Fatura</th>
+                                <th>Conta</th>
+                                <th>Mês/Ano</th>
+                                <th>Mensagem</th>
+                                <th>Status</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="tbody-erros"></tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
     </main>
 
     <script src="/static/graficos.js"></script>
     <script src="/static/dados.js"></script>
     <script src="/static/dashboard.js"></script>
+    <script src="/static/erros.js"></script>
     <script src="/static/app.js"></script>
 </body>
 </html>

@@ -14,6 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 # Os extratores originais imprimem emojis de debug (✅❌🔎...) via print().
 # Num console/ambiente cujo stdout não seja UTF-8 (comum no Windows, e
@@ -40,8 +41,10 @@ from pipeline import (
 )
 from extratores.ocr_fallback import eh_texto_util, gerar_txt_via_ocr
 from extratores.pdftotext_fallback import PDFTOTEXT_CMD, converter_pdf_para_txt
+from erros_reportados import atualizar_status, criar_erro, inicializar_db, listar_erros
 
 app = FastAPI(title="Extrator de Faturas de Água")
+inicializar_db()
 
 DIRETORIO_APP = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(DIRETORIO_APP, "templates"))
@@ -590,3 +593,54 @@ def dashboard_resumo():
         "top_consumo": top_consumo,
         "top_valor": top_valor,
     }
+
+
+# =========================================================
+# ERROS REPORTADOS (aba "Erros" da UI) — fila de revisão manual num
+# banco SQLite local (erros_reportados.db, gitignored). Não altera nada
+# em dados_saida/; é só o relato do usuário sobre uma fatura que parece
+# errada, pra alguém revisar depois.
+# =========================================================
+
+class NovoErro(BaseModel):
+    mensagem: str = Field(..., min_length=1, max_length=2000)
+    concessionaria: str = ""
+    num_fatura: str = ""
+    conta_dv: str = ""
+    mes_ano_ref: str = ""
+
+
+class AtualizarStatusErro(BaseModel):
+    status: str
+
+
+@app.get("/erros")
+def erros_listar(status: "str | None" = None):
+    if status and status not in ("aberto", "resolvido"):
+        raise HTTPException(status_code=400, detail="status deve ser 'aberto' ou 'resolvido'.")
+    return {"erros": listar_erros(status)}
+
+
+@app.post("/erros")
+def erros_criar(novo: NovoErro):
+    mensagem = novo.mensagem.strip()
+    if not mensagem:
+        raise HTTPException(status_code=400, detail="mensagem não pode ser vazia.")
+    return criar_erro(
+        mensagem=mensagem,
+        concessionaria=novo.concessionaria,
+        num_fatura=novo.num_fatura,
+        conta_dv=novo.conta_dv,
+        mes_ano_ref=novo.mes_ano_ref,
+    )
+
+
+@app.patch("/erros/{erro_id}")
+def erros_atualizar_status(erro_id: int, corpo: AtualizarStatusErro):
+    try:
+        atualizado = atualizar_status(erro_id, corpo.status)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if atualizado is None:
+        raise HTTPException(status_code=404, detail="Erro reportado não encontrado.")
+    return atualizado

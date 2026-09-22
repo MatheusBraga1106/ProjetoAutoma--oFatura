@@ -2,6 +2,19 @@
 
 Registro de onde este trabalho parou, pra continuar em outro dispositivo sem precisar reconstruir o contexto. Ver `ARQUITETURA.md` pra entender a estrutura; este arquivo é só a lista do que falta.
 
+## Sessão de 2026-09-22 — revisão da Fase 2 (regex por distribuidora)
+
+Com um `contas.json` real em mãos, entrei na "Fase 2" pendente abaixo (revisão sistêmica dos extratores). Commits `479a204`, `f7521b2`, `3446189`, `1188d90` (todos já no GitHub):
+
+- **SANEAGO**: faturas via OCR sem ESGOTO cadastrado perdiam o valor de SMRSU (caía na categoria errada e era zerado). Corrigido usando as flags do `contas.json` pra desambiguar.
+- **SAAE_ABADIANIA**: água/esgoto eram buscados só dentro do bloco errado do corte por "AUTENTICAÇÃO NO VERSO" (a 2ª via/canhoto, sem a tabela de valores) — saíam 0,00 na maioria das faturas. Corrigido buscando no texto inteiro do arquivo.
+- **SAAE_MINEIROS**: OCR às vezes lê "(-)" como "(=)" no total, que saía zerado. Corrigido aceitando os dois.
+- **Separação SMRSU vs. taxa genérica**: `VALOR_TAXAS_EXTRAS` era zerado quando `contas.json` marcava `SMRSU=False`, mas em 7 das 8 distribuidoras esse campo nunca foi SMRSU de verdade — é um resíduo genérico (`total - água - esgoto`) que pode ser qualquer taxa fixa real (`TARIFA BASICO OPERACIONAL`, `TARIFA BÁSICA`, `SERVIÇO BÁSICO ÁGUA`...). Criado `VALOR_OUTRAS_TAXAS`, nunca zerado por flag — `VALOR_TAXAS_EXTRAS` agora é exclusivo da SANEAGO.
+
+Resultado nos dados reais (1.119 faturas): suspeitos caíram de 217 pra 63. Restam: 40 na IPAMERI (residual sempre negativo nessa conta — IRPJ maior que a tarifa básica, dinheiro certo, só fica sinalizado por ser negativo, não é bug), 21 na SANEAGO (contas.json com flag possivelmente invertida numa conta + 1 ruído de OCR), 1 na SAAE_CORUMBA (total ilegível por OCR numa fatura só) e 1 na SAE (residual negativo real, mesma família da IPAMERI).
+
+Também adicionada a aba **Erros** (`static/erros.js` + `erros_reportados.py`, SQLite local) — formulário pra reportar problema numa fatura (com botão "Reportar erro" em cada linha da aba Dados, já pré-preenchido) e lista com status aberto/resolvido.
+
 ## Estado atual (o que já foi feito)
 
 - Análise completa do repositório, com 3 bugs sistêmicos identificados e corrigidos de forma genérica em `pipeline.py` (não tocaram a lógica interna de nenhum extrator):
@@ -15,16 +28,13 @@ Registro de onde este trabalho parou, pra continuar em outro dispositivo sem pre
 
 ## Pendente — Fase 2: revisão sistêmica dos extratores
 
-Isto é o trabalho combinado que ainda não começou. `pipeline.py` só adicionou travas genéricas (visibilidade, não correção) — a extração em si de cada distribuidora não foi revisada.
+Grande parte já feita na sessão de 2026-09-22 (ver acima) — sobram 63 suspeitos (era 217), a maioria já entendida e não são bugs de regex. O que ainda falta:
 
-**Ponto de partida sugerido:** a aba Dashboards já mostra **217 faturas marcadas como `SUSPEITO`** (valores que não fecham: água+esgoto+taxas ≠ total, ou taxa negativa) — 109 SANEAGO, 61 SAAE_CORUMBA, 39 IPAMERI, 5 DEMAE, 3 SAE. Dá pra abrir a aba Dados, filtrar por essas distribuidoras e olhar as linhas com o badge "⚠ suspeita" como amostra guiada de onde os regex estão errando.
-
-**Caso concreto já identificado** (documentado no commit da interface web): em `corrigir_distribuicao_financeira` (dentro de `enriquecer_com_contas_json`), quando `contas.json` marca `SMRSU=False` pra uma conta mas o extrator jogou um valor real de "taxa básica" (não SMRSU) em `VALOR_TAXAS_EXTRAS`, esse valor é zerado — descasando do total. Aconteceu com BURITI_ALEGRE no teste. Vale decidir: o campo `VALOR_TAXAS_EXTRAS` devia ter uma subdivisão (SMRSU vs. outras taxas), ou a flag do `contas.json` está incompleta pra essas contas?
-
-**Por distribuidora, olhar:**
-- Precisão de regex de data/valor em cada `extrair_*` (`extratores/*.py`).
-- O corte "à tesoura" (`AUTENTICAÇÃO NO VERSO` / `Autenticação Mecânica`) que gera as linhas residuais — dá pra cortar de um jeito que não sobre resíduo, em vez de só filtrar depois.
-- Otimizar o fallback OCR (`extratores/ocr_fallback.py`): DPI/PSM do Tesseract, tempo de processamento em lotes grandes, taxa de acerto em PDF-imagem.
+- **SANEAGO, 21 restantes**: pelo menos 1 caso (conta `75696 2`, "Palácio da Justiça/Área Verde") em que a fatura só cobra ÁGUA mas o `contas.json` marca `AGUA=False, ESGOTO=True` — parece flag invertida no cadastro, não bug de código. Vale conferir com quem mantém o `contas.json`. Tem também 1 ruído de OCR isolado (dígito espúrio ",11" lido como valor de esgoto).
+- **SAAE_CORUMBA, 1 restante** (fatura 637542): OCR devolveu "Declaração: as 47385" no lugar do valor total — texto corrompido demais pra recuperar por regex. Só resolve com OCR melhor (DPI/PSM) ou revisão manual do PDF original.
+- **IPAMERI (40) e SAE (1)**: não são bugs — residual negativo real (retenção de IRPJ maior que a tarifa básica). Ficam sinalizados de propósito pra revisão humana, não pra "corrigir".
+- **Fallback OCR em geral** (`extratores/ocr_fallback.py`): DPI/PSM do Tesseract, tempo de processamento em lotes grandes — os casos acima que travam em "OCR ilegível" só melhoram por aqui.
+- Precisão de regex de data/valor nos `extrair_*` que ainda não foram auditados a fundo (BURITI_ALEGRE, CODEGO — este último sem dados reais testados ainda).
 
 ## Outras pendências menores (não bloqueantes)
 
