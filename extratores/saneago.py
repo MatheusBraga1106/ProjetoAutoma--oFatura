@@ -24,11 +24,45 @@ def carregar_mapa_contas(caminho_json="contas.json"):
     return mapa
 
 
-def extrair_saneago(caminho_txt, is_ocr=False, contas_conhecidas=None):
+def _chave_conta(valor) -> str:
+    """Mesma normalização de pipeline.normalizar_conta_dv (só dígitos, sem
+    zeros à esquerda) — duplicada aqui pra não criar import circular com
+    pipeline.py, que já importa este módulo."""
+    digitos = re.sub(r"\D", "", str(valor) if valor is not None else "")
+    if not digitos:
+        return ""
+    return digitos.lstrip("0") or "0"
+
+
+def carregar_flags_contas(caminho_json="contas.json"):
+    """Mapa chave-de-conta -> {'AGUA','ESGOTO','SMRSU'} (bool), a partir do
+    contas.json. Usado só para desambiguar, em faturas via OCR, qual das
+    colunas de valor (ÁGUA/ESGOTO/SMRSU) corresponde a um valor financeiro
+    quando a posição de coluna não pôde ser calculada (ver comentário mais
+    abaixo, na atribuição por ordem de aparição)."""
+    if not os.path.exists(caminho_json):
+        return {}
+    with open(caminho_json, encoding="utf-8") as f:
+        registros = json.load(f)
+    mapa = {}
+    for r in registros:
+        chave = _chave_conta(r.get("CONTA_DV"))
+        if chave:
+            mapa[chave] = {
+                "AGUA": bool(r.get("AGUA", False)),
+                "ESGOTO": bool(r.get("ESGOTO", False)),
+                "SMRSU": bool(r.get("SMRSU", False)),
+            }
+    return mapa
+
+
+def extrair_saneago(caminho_txt, is_ocr=False, contas_conhecidas=None, flags_contas=None):
     print("  Iniciando extração: SANEAGO PRINCIPAL" + (" (texto via OCR)" if is_ocr else ""))
 
     if is_ocr and contas_conhecidas is None:
         contas_conhecidas = carregar_mapa_contas()
+    if is_ocr and flags_contas is None:
+        flags_contas = carregar_flags_contas()
 
     with open(caminho_txt, 'r', encoding='utf-8', errors='replace') as f:
         linhas = f.readlines()
@@ -268,11 +302,24 @@ def extrair_saneago(caminho_txt, is_ocr=False, contas_conhecidas=None):
                         elif categoria == 'SMRSU':
                             val_smrsu = val
                 else:
-                    # Cabeçalho não reconhecido: mantém o comportamento antigo
+                    # Cabeçalho não reconhecido (típico do texto via OCR, que
+                    # não preserva coluna): mantém o comportamento antigo
                     # (ordem de aparição) como rede de segurança.
                     val_agua = valores_financeiros[0] if len(valores_financeiros) > 0 else "0.00"
                     val_esgoto = valores_financeiros[1] if len(valores_financeiros) > 1 else "0.00"
                     val_smrsu = valores_financeiros[2] if len(valores_financeiros) > 2 else "0.00"
+
+                    # Caso ambíguo: só 2 valores financeiros na linha, mas a
+                    # conta pode não ter ESGOTO (o 2º valor seria SMRSU, não
+                    # ESGOTO) — ordem de aparição sozinha não distingue os
+                    # dois casos. Usa o contas.json (se a conta tiver flag
+                    # ESGOTO=False e SMRSU=True) pra decidir; sem essa
+                    # informação, mantém a suposição antiga (água, esgoto).
+                    if len(valores_financeiros) == 2 and flags_contas:
+                        flags = flags_contas.get(_chave_conta(conta_dv))
+                        if flags and not flags["ESGOTO"] and flags["SMRSU"]:
+                            val_esgoto = "0.00"
+                            val_smrsu = valores_financeiros[1]
 
                 # Matemática Absoluta
                 consumo_f = formatar_para_sql(val_consumo)
