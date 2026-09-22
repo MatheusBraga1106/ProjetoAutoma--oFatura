@@ -78,8 +78,10 @@ def extrair_demae(caminho_txt):
         match_total = re.search(r'TOTAL A PAGAR\s+([\d\.,]+)', pagina_texto, re.IGNORECASE)
         total_f = formatar_para_sql(match_total.group(1)) if match_total else 0.0
 
-        # O que sobrar do total menos água e esgoto, vai para taxas extras (ex: Taxa de lixo)
-        taxas_extras_f = round(total_f - agua_f - esgoto_f, 2)
+        # Resíduo genérico (ex: Taxa de lixo) — não é necessariamente SMRSU,
+        # é "qualquer outra coisa que não água/esgoto". Ver VALOR_OUTRAS_TAXAS
+        # em pipeline.py: nunca é zerada por flag do contas.json.
+        outras_taxas_f = round(total_f - agua_f - esgoto_f, 2)
 
         if num_fatura != "NÃO ACHOU" or conta_dv != "NÃO ACHOU":
             print(f"   🔎 RAIO-X DEMAE (Bloco {indice}):")
@@ -102,7 +104,8 @@ def extrair_demae(caminho_txt):
                 "CONSUMO_M3": consumo_f,
                 "VALOR_AGUA": agua_f,
                 "VALOR_ESGOTO": esgoto_f,
-                "VALOR_TAXAS_EXTRAS": taxas_extras_f,
+                "VALOR_TAXAS_EXTRAS": 0.0,
+                "VALOR_OUTRAS_TAXAS": outras_taxas_f,
                 "VALOR_TOTAL": total_f,
                 "DATA_PROCESSAMENTO": data_lote
             })

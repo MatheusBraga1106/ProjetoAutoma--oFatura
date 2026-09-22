@@ -94,6 +94,7 @@
             tr.appendChild(celula(formatarMoeda(linha.VALOR_AGUA)));
             tr.appendChild(celula(formatarMoeda(linha.VALOR_ESGOTO)));
             tr.appendChild(celula(formatarMoeda(linha.VALOR_TAXAS_EXTRAS)));
+            tr.appendChild(celula(formatarMoeda(linha.VALOR_OUTRAS_TAXAS)));
             tr.appendChild(celula(formatarMoeda(linha.VALOR_TOTAL)));
 
             const tdSuspeita = document.createElement("td");

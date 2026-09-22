@@ -186,11 +186,29 @@ def enriquecer_com_contas_json(df: pd.DataFrame, caminho_json: str) -> tuple[pd.
     for col in COLUNAS_FLAG:
         df[col] = df[col].fillna(False).astype(bool) if col in df.columns else False
 
+    # VALOR_OUTRAS_TAXAS nunca é tocada por flag nenhuma (ver comentário na
+    # função abaixo) — só garante que a coluna sempre existe, com o mesmo
+    # motivo do fillna de COLUNAS_ENRIQUECIMENTO/COLUNAS_FLAG acima.
+    if "VALOR_OUTRAS_TAXAS" not in df.columns:
+        df["VALOR_OUTRAS_TAXAS"] = 0.0
+    df["VALOR_OUTRAS_TAXAS"] = df["VALOR_OUTRAS_TAXAS"].fillna(0.0)
+
     def corrigir_distribuicao_financeira(row):
         if not (row.get("AGUA", False) or row.get("ESGOTO", False) or row.get("SMRSU", False)):
             return row.get("VALOR_AGUA", 0.0), row.get("VALOR_ESGOTO", 0.0), row.get("VALOR_TAXAS_EXTRAS", 0.0)
         agua = row.get("VALOR_AGUA", 0.0) if row.get("AGUA", False) else 0.0
         esgoto = row.get("VALOR_ESGOTO", 0.0) if row.get("ESGOTO", False) else 0.0
+        # A flag SMRSU do contas.json só é confiável pra SANEAGO, cuja
+        # fatura tem uma coluna "SMRSU" própria e nomeada (extrair_saneago
+        # captura o valor exato dessa coluna). Os outros extratores usam
+        # VALOR_TAXAS_EXTRAS/VALOR_OUTRAS_TAXAS como resíduo genérico
+        # (total - água - esgoto) pra representar qualquer taxa fixa da
+        # fatura que não seja água/esgoto (ex: "Tarifa Básica Operacional"
+        # da SAAE_CORUMBA, "SERVIÇO BÁSICO ÁGUA" da SAE, "TARIFA BÁSICA" da
+        # BURITI_ALEGRE/IPAMERI) — não necessariamente SMRSU. Zerar esse
+        # resíduo pela flag SMRSU=False descartava dinheiro real dessas
+        # distribuidoras. Por isso só SANEAGO zera por essa flag; as demais
+        # sempre mantêm VALOR_OUTRAS_TAXAS como veio do extrator.
         smrsu = row.get("VALOR_TAXAS_EXTRAS", 0.0) if row.get("SMRSU", False) else 0.0
         return agua, esgoto, smrsu
 
@@ -221,14 +239,16 @@ def filtrar_linhas_vazias(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 def marcar_suspeitas(df: pd.DataFrame) -> pd.DataFrame:
-    """Marca SUSPEITO=True quando as taxas extras saíram negativas ou a soma
-    ÁGUA+ESGOTO+TAXAS diverge do TOTAL em mais de 5 centavos — indício de que
-    algum regex do extrator não capturou o valor certo naquela fatura. Só
-    sinaliza pra revisão manual, não corrige nada."""
+    """Marca SUSPEITO=True quando as taxas (SMRSU ou outras) saíram negativas
+    ou a soma ÁGUA+ESGOTO+TAXAS_EXTRAS+OUTRAS_TAXAS diverge do TOTAL em mais
+    de 5 centavos — indício de que algum regex do extrator não capturou o
+    valor certo naquela fatura. Só sinaliza pra revisão manual, não corrige
+    nada."""
     df = df.copy()
-    esperado = df["VALOR_AGUA"] + df["VALOR_ESGOTO"] + df["VALOR_TAXAS_EXTRAS"]
+    outras_taxas = df.get("VALOR_OUTRAS_TAXAS", 0.0)
+    esperado = df["VALOR_AGUA"] + df["VALOR_ESGOTO"] + df["VALOR_TAXAS_EXTRAS"] + outras_taxas
     diverge = (esperado - df["VALOR_TOTAL"]).abs() > 0.05
-    negativo = df["VALOR_TAXAS_EXTRAS"] < 0
+    negativo = (df["VALOR_TAXAS_EXTRAS"] < 0) | (outras_taxas < 0)
     df["SUSPEITO"] = (diverge | negativo).fillna(False)
     return df
 

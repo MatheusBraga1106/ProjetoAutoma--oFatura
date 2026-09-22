@@ -83,7 +83,10 @@ def extrair_saae_corumba(caminho_txt):
         match_total = re.search(r'\(-\)\s*Valor do Pagamento\s*(?:Declara[çc][aã]o:)?\s*R\$\s*([\d\.,]+)', pagina_texto, re.IGNORECASE)
         total_f = formatar_para_sql(match_total.group(1)) if match_total else 0.0
 
-        taxas_extras_f = round(total_f - agua_f - esgoto_f, 2)
+        # Resíduo genérico (ex: TARIFA BASICO OPERACIONAL) — não é SMRSU, é
+        # "qualquer outra coisa que não água/esgoto". Ver VALOR_OUTRAS_TAXAS
+        # em pipeline.py: nunca é zerada por flag do contas.json.
+        outras_taxas_f = round(total_f - agua_f - esgoto_f, 2)
 
         if num_fatura != "NÃO ACHOU" or conta_dv != "NÃO ACHOU":
             print(f"   🔎 RAIO-X SAAE CORUMBÁ (Bloco {indice}):")
@@ -106,7 +109,8 @@ def extrair_saae_corumba(caminho_txt):
                 "CONSUMO_M3": consumo_f,
                 "VALOR_AGUA": agua_f,
                 "VALOR_ESGOTO": esgoto_f,
-                "VALOR_TAXAS_EXTRAS": taxas_extras_f,
+                "VALOR_TAXAS_EXTRAS": 0.0,
+                "VALOR_OUTRAS_TAXAS": outras_taxas_f,
                 "VALOR_TOTAL": total_f,
                 "DATA_PROCESSAMENTO": data_lote
             })
