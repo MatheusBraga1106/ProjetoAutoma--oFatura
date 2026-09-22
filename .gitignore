@@ -16,3 +16,7 @@ venv/
 # SO
 .DS_Store
 Thumbs.db
+
+# Logs locais do servidor (uvicorn rodando em background durante o dev)
+uvicorn_out.log
+uvicorn_err.log

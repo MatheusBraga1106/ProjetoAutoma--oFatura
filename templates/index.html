@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Extrator de Faturas de Água</title>
+    <link rel="stylesheet" href="/static/estilo.css">
+</head>
+<body>
+    <header class="topo">
+        <h1>💧 Extrator de Faturas de Água</h1>
+        <p class="subtitulo">Envie faturas, acompanhe a extração e explore os dados já consolidados.</p>
+        <nav class="abas-nav">
+            <button class="aba-botao ativo" data-aba="processar" type="button">Processar</button>
+            <button class="aba-botao" data-aba="dados" type="button">Dados</button>
+            <button class="aba-botao" data-aba="dashboards" type="button">Dashboards</button>
+        </nav>
+    </header>
+
+    <main>
+        <!-- ================= ABA: PROCESSAR ================= -->
+        <div id="aba-processar" class="aba">
+            <section id="banner-status" class="banner" hidden></section>
+
+            <section id="area-upload" class="cartao">
+                <h2>1. Selecionar faturas</h2>
+                <div id="zona-drop" class="zona-drop">
+                    <p>Arraste PDFs (ou uma pasta) aqui, ou use os botões abaixo.</p>
+                    <div class="botoes-upload">
+                        <label class="botao secundario">
+                            Selecionar arquivos
+                            <input id="input-arquivos" type="file" accept="application/pdf" multiple hidden>
+                        </label>
+                        <label class="botao secundario">
+                            Selecionar pasta
+                            <input id="input-pasta" type="file" webkitdirectory directory multiple hidden>
+                        </label>
+                    </div>
+                </div>
+
+                <div id="lista-selecionados" class="lista-arquivos" hidden>
+                    <h3>Arquivos selecionados (<span id="contagem-selecionados">0</span>)</h3>
+                    <ul id="ul-selecionados"></ul>
+                </div>
+
+                <div class="acoes">
+                    <button id="botao-processar" class="botao primario" disabled>Processar</button>
+                    <button id="botao-limpar" class="botao secundario" disabled>Limpar seleção</button>
+                </div>
+            </section>
+
+            <section id="area-progresso" class="cartao" hidden>
+                <h2>2. Progresso</h2>
+                <div class="barra-progresso">
+                    <div id="barra-progresso-preenchida" class="barra-progresso-preenchida"></div>
+                </div>
+                <p id="texto-progresso" class="texto-progresso"></p>
+                <ul id="ul-progresso" class="lista-progresso"></ul>
+            </section>
+
+            <section id="area-resultados" class="cartao" hidden>
+                <h2>3. Resultado consolidado</h2>
+                <table id="tabela-resultados" class="tabela">
+                    <thead>
+                        <tr>
+                            <th>Distribuidora</th>
+                            <th>Adicionadas</th>
+                            <th>Duplicadas</th>
+                            <th>Suspeitas</th>
+                            <th>Descartadas</th>
+                            <th>Sem cadastro (contas.json)</th>
+                            <th>CSV</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tbody-resultados"></tbody>
+                </table>
+
+                <details id="detalhe-erros" class="detalhe-erros" hidden>
+                    <summary>Arquivos com erro</summary>
+                    <ul id="ul-erros"></ul>
+                </details>
+            </section>
+        </div>
+
+        <!-- ================= ABA: DADOS ================= -->
+        <div id="aba-dados" class="aba" hidden>
+            <section class="cartao">
+                <div class="filtros-dados">
+                    <label class="campo-filtro">
+                        Distribuidora
+                        <select id="select-empresa"></select>
+                    </label>
+                    <label class="campo-filtro campo-busca">
+                        Buscar (cliente, conta, fatura, arquivo)
+                        <input id="input-busca-dados" type="search" placeholder="ex.: Fórum de Anápolis">
+                    </label>
+                    <a id="link-baixar-csv" class="botao secundario" href="#" target="_blank" rel="noopener">Baixar CSV completo</a>
+                </div>
+
+                <p id="texto-vazio-dados" class="texto-progresso" hidden>Nenhuma fatura encontrada.</p>
+
+                <div class="tabela-scroll">
+                    <table id="tabela-dados" class="tabela">
+                        <thead>
+                            <tr>
+                                <th>Fatura</th>
+                                <th>Mês/Ano</th>
+                                <th>Conta</th>
+                                <th>Cliente</th>
+                                <th>Unidade Judiciária</th>
+                                <th>Consumo (m³)</th>
+                                <th>Água</th>
+                                <th>Esgoto</th>
+                                <th>Taxas</th>
+                                <th>Total</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody id="tbody-dados"></tbody>
+                    </table>
+                </div>
+
+                <div class="paginacao">
+                    <button id="botao-pagina-anterior" class="botao secundario" disabled>‹ Anterior</button>
+                    <span id="texto-paginacao"></span>
+                    <button id="botao-pagina-proxima" class="botao secundario" disabled>Próxima ›</button>
+                </div>
+            </section>
+        </div>
+
+        <!-- ================= ABA: DASHBOARDS ================= -->
+        <div id="aba-dashboards" class="aba" hidden>
+            <section class="linha-kpis">
+                <div class="stat-tile">
+                    <span class="stat-label">Total de faturas</span>
+                    <span class="stat-valor" id="kpi-total-faturas">–</span>
+                </div>
+                <div class="stat-tile">
+                    <span class="stat-label">Valor total</span>
+                    <span class="stat-valor" id="kpi-valor-total">–</span>
+                </div>
+                <div class="stat-tile">
+                    <span class="stat-label">Consumo total (m³)</span>
+                    <span class="stat-valor" id="kpi-consumo-total">–</span>
+                </div>
+                <div class="stat-tile">
+                    <span class="stat-label">Faturas suspeitas</span>
+                    <span class="stat-valor" id="kpi-suspeitas">–</span>
+                </div>
+            </section>
+
+            <section class="grade-graficos">
+                <figure class="cartao cartao-grafico">
+                    <figcaption>Valor total por distribuidora</figcaption>
+                    <div id="grafico-valor-empresa" class="area-grafico"></div>
+                </figure>
+                <figure class="cartao cartao-grafico">
+                    <figcaption>Faturas suspeitas por distribuidora</figcaption>
+                    <div id="grafico-suspeitas-empresa" class="area-grafico"></div>
+                </figure>
+            </section>
+
+            <section class="grade-graficos">
+                <figure class="cartao cartao-grafico">
+                    <figcaption>Valor total por mês (R$)</figcaption>
+                    <div id="grafico-valor-mensal" class="area-grafico"></div>
+                </figure>
+                <figure class="cartao cartao-grafico">
+                    <figcaption>Consumo total por mês (m³)</figcaption>
+                    <div id="grafico-consumo-mensal" class="area-grafico"></div>
+                </figure>
+            </section>
+
+            <section class="grade-tabelas">
+                <div class="cartao">
+                    <h3>Maiores consumos</h3>
+                    <table class="tabela">
+                        <thead><tr><th>Distribuidora</th><th>Cliente</th><th>Mês/Ano</th><th>Consumo (m³)</th></tr></thead>
+                        <tbody id="tbody-top-consumo"></tbody>
+                    </table>
+                </div>
+                <div class="cartao">
+                    <h3>Maiores valores</h3>
+                    <table class="tabela">
+                        <thead><tr><th>Distribuidora</th><th>Cliente</th><th>Mês/Ano</th><th>Valor (R$)</th></tr></thead>
+                        <tbody id="tbody-top-valor"></tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <script src="/static/graficos.js"></script>
+    <script src="/static/dados.js"></script>
+    <script src="/static/dashboard.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

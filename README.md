@@ -17,9 +17,23 @@ SANEAGO, SAE, CODEGO, Águas de Ipameri, Buriti Alegre Ambiental, DEMAE, SAAE Ab
 
 Arquitetura modular: adicionar uma nova distribuidora é criar um novo parser em `extratores/` e registrar seu padrão de identificação no roteador em `Main.py`.
 
+## Interface web
+
+Além do modo CLI (`Main.py`, varrendo `dados_entrada/`), há uma interface web que dispara o mesmo pipeline completo (identificação → pdftotext → fallback OCR → extração → cruzamento SANEAGO/analítica → enriquecimento via `contas.json` → consolidação em CSV) a partir de upload de arquivos ou de uma pasta inteira, com progresso em tempo real.
+
+```
+pip install -r requirements.txt
+uvicorn api:app --reload
+```
+
+Abra `http://localhost:8000/`. Os CSVs consolidados são gravados no mesmo `dados_saida/` do modo CLI (os dois modos compartilham a lógica de roteamento, cruzamento, enriquecimento e anti-duplicata via `pipeline.py`, então rodar por um ou outro modo não diverge o resultado).
+
+> O acompanhamento de progresso (`/pipeline/jobs/*`) guarda o estado dos jobs em memória do processo — não sobrevive a um restart do servidor nem escala para múltiplas instâncias. Suficiente para o volume atual (uso único, poucas centenas de PDFs por lote); revisitar se o projeto crescer para processamento concorrente/distribuído.
+
 ## Stack
 
-- Python (pandas, unicodedata, regex)
+- Python (FastAPI, pandas, unicodedata, regex)
+- Jinja2 + JS vanilla (interface web, sem build step)
 - Shell script para pré-processamento de PDFs
 
 ## Skills demonstradas

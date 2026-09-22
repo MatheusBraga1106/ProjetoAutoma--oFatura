@@ -1,63 +1,34 @@
 import os
 import sys
+
 import pandas as pd
-import unicodedata
 
 # Terminal sempre atualizado em tempo real (sem esperar o buffer encher),
 # mesmo quando a saída é redirecionada/capturada por outro processo.
 sys.stdout.reconfigure(line_buffering=True)
 
-# Importando os extratores prontos
-from extratores.saneago import extrair_saneago
-from extratores.saneago_analitica import extrair_saneago_analitica
-from extratores.sae import extrair_sae
-from extratores.codego import extrair_codego
-
-# Importando TODOS os outros extratores (ativados)
-from extratores.aguas_ipameri import extrair_aguas_ipameri
-from extratores.buriti_alegre import extrair_buriti_alegre
-from extratores.demae import extrair_demae
-from extratores.saae_abadiania import extrair_saae_abadiania
-from extratores.saae_corumba import extrair_saae_corumba
-from extratores.saae_mineiros import extrair_saae_mineiros
-# from extratores.sanesc import extrair_sanesc
-# from extratores.chesp import extrair_chesp
-
+from pipeline import (
+    PASTA_BASE,
+    EMPRESAS_CONHECIDAS,
+    EXTRATORES_POR_EMPRESA,
+    EXTRATORES_NAO_IMPLEMENTADOS,
+    identificar_distribuidora,
+    mesclar_saneago_com_analitica,
+    enriquecer_com_contas_json,
+    filtrar_linhas_vazias,
+    marcar_suspeitas,
+    salvar_incremental,
+)
 from extratores.ocr_fallback import eh_texto_ocr, detectar_faturas_sem_texto, gerar_txt_via_ocr
 from extratores.pdftotext_fallback import converter_pdf_para_txt
 
 
-# Pasta onde este arquivo está, para resolver caminhos relativos sempre a
-# partir daqui — e não do diretório de onde o script foi chamado (isso
-# quebrava ao rodar pelo botão "Run" da IDE, cujo cwd é a raiz do
-# workspace, não a pasta do projeto).
-PASTA_BASE = os.path.dirname(os.path.abspath(__file__))
-
-
-def normalizar_texto(texto):
-    """Remove acentos e coloca em minúsculas para facilitar a correspondência no IF"""
-    texto = str(texto).lower()
-    return ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
-
-
 def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
     os.makedirs(pasta_saida, exist_ok=True)
-    
-    # Gavetas de armazenamento em memória atualizadas
-    dados_por_empresa = {
-        "SANEAGO": [],
-        "SANEAGO_ANALITICA": [], 
-        "SAE": [],
-        "CODEGO": [],
-        "IPAMERI": [],
-        "BURITI_ALEGRE": [],
-        "DEMAE": [],
-        "SAAE_ABADIANIA": [],
-        "SAAE_CORUMBA": [],
-        "SAAE_MINEIROS": [],
-        "SANESC": [],
-        "CHESP": []
-    }
+
+    # Gavetas de armazenamento em memória, uma por distribuidora conhecida
+    # (implementada ou não — ver EXTRATORES_NAO_IMPLEMENTADOS em pipeline.py).
+    dados_por_empresa = {empresa: [] for empresa in EMPRESAS_CONHECIDAS}
 
     print(f"🕷️ A iniciar rastreamento na pasta raiz: '{pasta_raiz}'\n")
 
@@ -105,79 +76,28 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
             arquivos_processados += 1
             # Cria o caminho absoluto (C:\...)
             caminho_completo = os.path.abspath(os.path.join(diretorio_atual, arquivo))
-            
+
             # 🛡️ TRUQUE ANTI-LIMITE DO WINDOWS (MAX_PATH > 260 caracteres)
             if os.name == 'nt' and not caminho_completo.startswith('\\\\?\\'):
                 caminho_completo = '\\\\?\\' + caminho_completo
-            
-            # Normalizamos o nome da pasta e do ficheiro
-            nome_arquivo_norm = normalizar_texto(arquivo)
-            nome_pasta_norm = normalizar_texto(diretorio_atual)
-            
-            # Junta os dois para facilitar a procura da palavra-chave
-            alvo_busca = f"{nome_arquivo_norm} {nome_pasta_norm}"
-            
-            df_extraido = None
-            empresa_identificada = None
 
             print(f" [{arquivos_processados}/{total_txt}] Lendo: {arquivo} (Pasta: {os.path.basename(diretorio_atual)})")
 
             # =========================================================
-            # ROTEADOR INTELIGENTE (TOTALMENTE ATIVADO)
+            # ROTEADOR (tabela compartilhada com a API, em pipeline.py)
             # =========================================================
-            if "saneago" in alvo_busca and "analitica" in alvo_busca:
-                df_extraido = extrair_saneago_analitica(caminho_completo)
-                empresa_identificada = "SANEAGO_ANALITICA"
-                
-            elif "saneago" in alvo_busca and "analitica" not in alvo_busca:
-                df_extraido = extrair_saneago(caminho_completo, is_ocr=eh_texto_ocr(caminho_completo))
-                empresa_identificada = "SANEAGO"
-                
-            elif "codego" in alvo_busca:
-                df_extraido = extrair_codego(caminho_completo)
-                empresa_identificada = "CODEGO"
-                
-            elif "ipameri" in alvo_busca:
-                df_extraido = extrair_aguas_ipameri(caminho_completo)
-                empresa_identificada = "IPAMERI"
-                
-            elif "buriti alegre" in alvo_busca:
-                df_extraido = extrair_buriti_alegre(caminho_completo)
-                empresa_identificada = "BURITI_ALEGRE"
-                
-            elif "demae" in alvo_busca:
-                df_extraido = extrair_demae(caminho_completo)
-                empresa_identificada = "DEMAE"
-                
-            elif "abadiania" in alvo_busca:
-                df_extraido = extrair_saae_abadiania(caminho_completo)
-                empresa_identificada = "SAAE_ABADIANIA"
-                
-            elif "corumba" in alvo_busca:
-                df_extraido = extrair_saae_corumba(caminho_completo)
-                empresa_identificada = "SAAE_CORUMBA"
-                
-            elif "mineiros" in alvo_busca:
-                df_extraido = extrair_saae_mineiros(caminho_completo)
-                empresa_identificada = "SAAE_MINEIROS"
-                
-            elif "sanesc" in alvo_busca:
-                print(" ⏭ Extrator SANESC ainda não criado. A saltar...")
-                # df_extraido = extrair_sanesc(caminho_completo)
-                empresa_identificada = "SANESC"
-                
-            elif "chesp" in alvo_busca:
-                print(" ⏭ Extrator CHESP ainda não criado. A saltar...")
-                # df_extraido = extrair_chesp(caminho_completo)
-                empresa_identificada = "CHESP"
-                
-            elif "sae" in alvo_busca and "saae" not in alvo_busca:
-                df_extraido = extrair_sae(caminho_completo)
-                empresa_identificada = "SAE"
-                
-            else:
-                print(f" ⏭ Ignorado: Não foi possível identificar a empresa.")
+            empresa_identificada = identificar_distribuidora(f"{arquivo} {diretorio_atual}")
+
+            if empresa_identificada is None:
+                print(" ⏭ Ignorado: Não foi possível identificar a empresa.")
                 continue
+
+            if empresa_identificada in EXTRATORES_NAO_IMPLEMENTADOS:
+                print(f" ⏭ Extrator {empresa_identificada} ainda não criado. A saltar...")
+                continue
+
+            is_ocr = eh_texto_ocr(caminho_completo)
+            df_extraido = EXTRATORES_POR_EMPRESA[empresa_identificada](caminho_completo, is_ocr)
 
             # =========================================================
             # GUARDA O RESULTADO NA GAVETA CORRETA
@@ -187,66 +107,15 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
                 df_extraido['PASTA_ORIGEM'] = diretorio_atual
                 dados_por_empresa[empresa_identificada].append(df_extraido)
 
-
     # =========================================================
     # RELACIONAMENTO 1: SANEAGO NORMAL + SANEAGO ANALÍTICA (HIDRÔMETROS)
     # =========================================================
     if len(dados_por_empresa["SANEAGO"]) > 0 and len(dados_por_empresa["SANEAGO_ANALITICA"]) > 0:
         print("\n🔗 Relacionando faturas da SANEAGO com hidrômetros analíticos...")
-        
         df_saneago = pd.concat(dados_por_empresa["SANEAGO"], ignore_index=True)
         df_analitica = pd.concat(dados_por_empresa["SANEAGO_ANALITICA"], ignore_index=True)
-        
-        # Garante que a coluna MES_ANO_REF exista na analítica mesmo se nenhum arquivo tiver data
-        if 'MES_ANO_REF' not in df_analitica.columns:
-            df_analitica['MES_ANO_REF'] = ""
-            
-        # Padroniza as chaves removendo espaços extras
-        df_saneago['CONTA_DV'] = df_saneago['CONTA_DV'].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
-        df_analitica['CONTA_DV'] = df_analitica['CONTA_DV'].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
-        
-        df_saneago['MES_ANO_REF'] = df_saneago['MES_ANO_REF'].astype(str).str.strip()
-        df_analitica['MES_ANO_REF'] = df_analitica['MES_ANO_REF'].astype(str).str.strip()
-
-        # ---------------------------------------------------------
-        # CRIANDO O "PLANO B" (Mapa do Hidrômetro Mais Recente)
-        # ---------------------------------------------------------
-        df_analitica['DATA_ORDENACAO'] = pd.to_datetime(df_analitica['MES_ANO_REF'], format='%m/%Y', errors='coerce')
-        df_analitica_ordenada = df_analitica.sort_values(by=['CONTA_DV', 'DATA_ORDENACAO'], ascending=[True, False])
-        hidrometros_recentes = df_analitica_ordenada.drop_duplicates(subset=['CONTA_DV'], keep='first')
-        
-        mapa_hidrometros = hidrometros_recentes.set_index('CONTA_DV')['NUM_HIDROMETRO_EXTRAIDO'].to_dict()
-        mapa_arquivos = hidrometros_recentes.set_index('CONTA_DV')['ARQUIVO_ORIGEM'].to_dict()
-        
-        df_analitica = df_analitica.drop(columns=['DATA_ORDENACAO'])
-
-        # ---------------------------------------------------------
-        # CRUZAMENTO EXATO (TENTATIVA 1 - Conta + Mês/Ano)
-        # ---------------------------------------------------------
-        df_analitica = df_analitica.drop_duplicates(subset=['CONTA_DV', 'MES_ANO_REF'])
-        df_cruzado = pd.merge(df_saneago, df_analitica, on=['CONTA_DV', 'MES_ANO_REF'], how='left')
-        df_cruzado['NUM_HIDROMETRO'] = df_cruzado['NUM_HIDROMETRO_EXTRAIDO']
-        
-        # ---------------------------------------------------------
-        # PREENCHIMENTO INTELIGENTE (TENTATIVA 2 - Apenas pela Conta)
-        # ---------------------------------------------------------
-        vazios = df_cruzado['NUM_HIDROMETRO'].isna() | (df_cruzado['NUM_HIDROMETRO'] == "") | (df_cruzado['NUM_HIDROMETRO'] == "nan")
-        df_cruzado.loc[vazios, 'NUM_HIDROMETRO'] = df_cruzado.loc[vazios, 'CONTA_DV'].map(mapa_hidrometros)
-        df_cruzado.loc[vazios, 'ARQUIVO_ORIGEM_y'] = df_cruzado.loc[vazios, 'CONTA_DV'].map(mapa_arquivos)
-
-        # ---------------------------------------------------------
-        # LIMPEZA FINAL DAS COLUNAS GERADAS PELO MERGE
-        # ---------------------------------------------------------
-        df_cruzado = df_cruzado.drop(columns=['NUM_HIDROMETRO_EXTRAIDO'])
-        
-        if 'ARQUIVO_ORIGEM_y' in df_cruzado.columns:
-            df_cruzado = df_cruzado.drop(columns=['ARQUIVO_ORIGEM_y', 'PASTA_ORIGEM_y'], errors='ignore')
-            df_cruzado = df_cruzado.rename(columns={'ARQUIVO_ORIGEM_x': 'ARQUIVO_ORIGEM', 'PASTA_ORIGEM_x': 'PASTA_ORIGEM'})
-        
-        # Atualiza a gaveta da Saneago e limpa a Analítica
-        dados_por_empresa["SANEAGO"] = [df_cruzado]
+        dados_por_empresa["SANEAGO"] = [mesclar_saneago_com_analitica(df_saneago, df_analitica)]
         dados_por_empresa["SANEAGO_ANALITICA"] = []
-
 
     # =========================================================
     # EXPORTAÇÃO INCREMENTAL E ENRIQUECIMENTO VIA JSON
@@ -255,99 +124,51 @@ def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
     print("🛡️ A SALVAR NA BASE DE DADOS E ENRIQUECER COM JSON")
     print("="*70)
 
+    caminho_json = os.path.join(PASTA_BASE, "contas.json")
+
     for empresa, lista_de_dfs in dados_por_empresa.items():
-        if len(lista_de_dfs) > 0 and empresa != "SANEAGO_ANALITICA":
-            df_novo_lote = pd.concat(lista_de_dfs, ignore_index=True)
-            
-            # =========================================================
-            # RELACIONAMENTO 2: ENRIQUECIMENTO DE DADOS COM O JSON
-            # =========================================================
-            caminho_json = os.path.join(PASTA_BASE, "contas.json")
-            if os.path.exists(caminho_json):
-                df_info_contas = pd.read_json(caminho_json)
+        if len(lista_de_dfs) == 0 or empresa == "SANEAGO_ANALITICA":
+            continue
 
-                colunas_json = [
-                    "CONTA_DV", "UNIDADE JUDICIÁRIA", "ENDEREÇO", "DISTRIBUIDORA",
-                    "AGUA", "ESGOTO", "SMRSU"
-                ]
-                colunas_existentes = [col for col in colunas_json if col in df_info_contas.columns]
-                df_info_contas = df_info_contas[colunas_existentes]
+        df_novo_lote = pd.concat(lista_de_dfs, ignore_index=True)
 
-                df_info_contas['CONTA_DV'] = df_info_contas['CONTA_DV'].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
-                df_novo_lote['CONTA_DV'] = df_novo_lote['CONTA_DV'].astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
+        df_novo_lote, info_enriquecimento = enriquecer_com_contas_json(df_novo_lote, caminho_json)
+        if not info_enriquecimento["contas_json_encontrado"]:
+            print(f" ⚠️ {empresa}: contas.json não encontrado — seguindo sem enriquecimento "
+                  f"(UNIDADE JUDICIÁRIA/ENDEREÇO ficam em branco).")
+        elif info_enriquecimento["linhas_sem_correspondencia"] > 0:
+            print(f" ⚠️ {empresa}: {info_enriquecimento['linhas_sem_correspondencia']} "
+                  f"fatura(s) sem conta correspondente no contas.json.")
 
-                df_novo_lote = pd.merge(df_novo_lote, df_info_contas, on="CONTA_DV", how="left")
+        df_novo_lote, descartadas = filtrar_linhas_vazias(df_novo_lote)
+        if descartadas:
+            print(f" 🗑️ {empresa}: {descartadas} linha(s) vazia(s)/residual(is) descartada(s).")
 
-                # Contas sem correspondência no JSON não têm flag nenhuma (não é "tem as 3"),
-                # senão a checagem "not (AGUA or ESGOTO or SMRSU)" trata NaN como verdadeiro.
-                for col_flag in ["AGUA", "ESGOTO", "SMRSU"]:
-                    if col_flag in df_novo_lote.columns:
-                        df_novo_lote[col_flag] = df_novo_lote[col_flag].fillna(False).astype(bool)
+        if df_novo_lote.empty:
+            continue
 
+        df_novo_lote = marcar_suspeitas(df_novo_lote)
+        qtd_suspeitas = int(df_novo_lote['SUSPEITO'].sum())
+        if qtd_suspeitas:
+            print(f" 🔍 {empresa}: {qtd_suspeitas} fatura(s) marcada(s) como SUSPEITO "
+                  f"(valores não batem) — revisar.")
 
-                # =========================================================
-                # 🛡️ NOVA CAMADA DE CONFERÊNCIA: REDISTRIBUIÇÃO DE VALORES
-                # Conservadora: nunca desloca um valor extraído de uma
-                # categoria pra outra (isso já é responsabilidade de cada
-                # extrator). Só ZERA um valor que caiu numa categoria que a
-                # conta não tem cadastrada no contas.json.
-                # =========================================================
-                def corrigir_distribuicao_financeira(row):
-                    if not (row.get('AGUA', False) or row.get('ESGOTO', False) or row.get('SMRSU', False)):
-                        return row.get('VALOR_AGUA', 0.0), row.get('VALOR_ESGOTO', 0.0), row.get('VALOR_TAXAS_EXTRAS', 0.0)
+        # =========================================================
+        # LÓGICA ANTI-DUPLICATA E SALVAMENTO CSV
+        # =========================================================
+        caminho_csv = os.path.join(pasta_saida, f"banco_dados_{empresa.lower()}.csv")
+        resultado = salvar_incremental(df_novo_lote, caminho_csv)
 
-                    agua = row.get('VALOR_AGUA', 0.0) if row.get('AGUA', False) else 0.0
-                    esgoto = row.get('VALOR_ESGOTO', 0.0) if row.get('ESGOTO', False) else 0.0
-                    smrsu = row.get('VALOR_TAXAS_EXTRAS', 0.0) if row.get('SMRSU', False) else 0.0
-                    return agua, esgoto, smrsu
-
-                df_novo_lote[['VALOR_AGUA', 'VALOR_ESGOTO', 'VALOR_TAXAS_EXTRAS']] = df_novo_lote.apply(
-                    lambda row: pd.Series(corrigir_distribuicao_financeira(row)), axis=1
-                )
-                
-                df_novo_lote['BASE_CALCULO'] = (df_novo_lote['VALOR_AGUA'] + df_novo_lote['VALOR_ESGOTO']).round(2)
-            
-            # =========================================================
-            # LÓGICA ANTI-DUPLICATA E SALVAMENTO CSV
-            # =========================================================
-            caminho_csv = os.path.join(pasta_saida, f"banco_dados_{empresa.lower()}.csv")
-            arquivo_existe = os.path.exists(caminho_csv)
-
-            if arquivo_existe:
-                df_antigo = pd.read_csv(caminho_csv, sep=";", dtype={'NUM_FATURA': str, 'MES_ANO_REF': str, 'CONTA_DV': str})
-                
-                cols_chave = ['NUM_FATURA', 'MES_ANO_REF', 'CONTA_DV']
-                df_antigo[cols_chave] = df_antigo[cols_chave].fillna("")
-                df_novo_lote[cols_chave] = df_novo_lote[cols_chave].fillna("")
-
-                chaves_antigas = set(
-                    df_antigo['NUM_FATURA'].astype(str) + "|" + 
-                    df_antigo['MES_ANO_REF'].astype(str) + "|" + 
-                    df_antigo['CONTA_DV'].astype(str)
-                )
-
-                df_novo_lote['CHAVE_TEMP'] = (
-                    df_novo_lote['NUM_FATURA'].astype(str) + "|" + 
-                    df_novo_lote['MES_ANO_REF'].astype(str) + "|" + 
-                    df_novo_lote['CONTA_DV'].astype(str)
-                )
-
-                df_inedito = df_novo_lote[~df_novo_lote['CHAVE_TEMP'].isin(chaves_antigas)].copy()
-                df_inedito.drop(columns=['CHAVE_TEMP'], inplace=True)
-                
-                qtd_duplicadas = len(df_novo_lote) - len(df_inedito)
-
-                if len(df_inedito) > 0:
-                    df_inedito.to_csv(caminho_csv, mode='a', index=False, sep=";", encoding="utf-8-sig", header=False)
-                    print(f"➕ {empresa}: {len(df_inedito)} faturas ADICIONADAS. (Ignoradas {qtd_duplicadas} duplicatas)")
-                else:
-                    print(f"⏩ {empresa}: Nenhuma fatura nova. (Ignoradas {qtd_duplicadas} faturas)")
-
-            else:
-                df_novo_lote.to_csv(caminho_csv, mode='w', index=False, sep=";", encoding="utf-8-sig", header=True)
-                print(f"✨ {empresa}: {len(df_novo_lote)} faturas gravadas. (Novo ficheiro criado)")
+        if resultado["arquivo_novo"]:
+            print(f"✨ {empresa}: {resultado['adicionadas']} faturas gravadas. (Novo ficheiro criado)")
+        elif resultado["adicionadas"] > 0:
+            print(f"➕ {empresa}: {resultado['adicionadas']} faturas ADICIONADAS. "
+                  f"(Ignoradas {resultado['duplicadas']} duplicatas)")
+        else:
+            print(f"⏩ {empresa}: Nenhuma fatura nova. (Ignoradas {resultado['duplicadas']} faturas)")
 
     print("="*70 + "\n")
+
 
 if __name__ == "__main__":
     PASTA_RAIZ_DADOS = os.path.join(PASTA_BASE, "dados_entrada")
