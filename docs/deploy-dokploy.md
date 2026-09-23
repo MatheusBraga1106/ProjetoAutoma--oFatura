@@ -178,14 +178,25 @@ docker exec <app>-faturas-db-1 psql -U faturas -d faturas -c 'DROP DATABASE fatu
 
 ## 9. Reextração completa (apagar a saída atual e refazer)
 
-> O comando exato para enfileirar depende da interface que a camada de persistência e o worker expuserem (upload pela UI gravando no S3 + tabela `jobs`, ou um comando de importação em lote). Ajuste o item 3 quando isso estiver pronto.
+A reextração é feita pelo `Main.py` (`python Main.py --help` lista as opções). Ele identifica a distribuidora pelo caminho relativo de cada PDF dentro da pasta, grava o PDF no storage e as faturas no banco, com deduplicação por conteúdo — rodar duas vezes não duplica nada.
 
-1. **Ponto de partida limpo**: banco recém-migrado, sem faturas. Se já houver faturas de teste, ou apague o volume antes do primeiro uso real, ou use o mecanismo de versão da camada de persistência. Não reaproveite os `.txt` locais: a ideia é regerar tudo (pdftotext + OCR) no servidor.
+1. **Ponto de partida limpo**: banco recém-migrado, sem faturas. Se já houver faturas de teste, apague o volume antes do primeiro uso real. Não reaproveite os `.txt` locais: a ideia é regerar tudo (pdftotext + OCR) no servidor, com as versões do Tesseract/poppler da imagem — é o mesmo texto que os uploads futuros vão gerar.
 2. **Mantenha as cópias locais** (`dados_entrada/`, `dados_saida/`, `dados_saida_backup_*`) até o passo 5.
-3. **Enviar os PDFs** (1.117 arquivos, 344 MB). O caminho mais simples é a aba *Processar* → selecionar a pasta `dados_entrada/` inteira. O upload por pasta preserva o caminho relativo, e é dele que `identificar_distribuidora` depende (a DEMAE, por exemplo, só é reconhecida pelo nome da pasta).
-4. **Acompanhar**: `docker logs -f <app>-faturas-worker-1`. Estimativa: 657 páginas de OCR a ~5 s cada (medido num Ryzen 5 5600X), algo como **1–2 h** na VPS. O resto (pdftotext + regex) leva minutos. O worker tem teto de 4 CPUs e 4 GB, então os outros projetos continuam respondendo.
-5. **Conferir contra o baseline local** antes de dar como pronto: cerca de 10,1 mil faturas no total (9.593 da SANEAGO) e 63 suspeitos (40 IPAMERI, 21 SANEAGO, 1 SAAE_CORUMBA, 1 SAE), conforme `PROXIMOS_PASSOS.md`. Diferença grande indica OCR diferente entre Windows e Linux (Tesseract 5.5 na imagem) ou falha de identificação por pasta.
+3. **Levar os PDFs pra dentro do worker e processar** (1.117 arquivos, 344 MB). Na sua máquina, copie só os PDFs (sem os `.txt`) pra VPS preservando a árvore de pastas — o caminho relativo é o que identifica a distribuidora (a DEMAE e todo o borderô SANEAGO só são reconhecidos pelo nome da pasta):
+   ```bash
+   rsync -av --include='*/' --include='*.pdf' --include='*.PDF' --exclude='*' dados_entrada/ usuario@vps:/tmp/entrada/
+   ```
+   Na VPS, copie pro container do worker (o `/tmp` dele é gravável) e rode:
+   ```bash
+   docker cp /tmp/entrada <app>-faturas-worker-1:/tmp/entrada
+   docker exec -it <app>-faturas-worker-1 python Main.py --pasta /tmp/entrada --ignorar-txt
+   ```
+   O `--ignorar-txt` garante texto novo mesmo se algum `.txt` escapar da cópia. Se a sessão SSH cair, rode de novo o mesmo comando: arquivos já processados com a mesma versão do extrator são pulados. Depois, apague `/tmp/entrada` do container e da VPS.
+   *Alternativa sem SSH*: aba **Processar** → **Selecionar pasta** → `dados_entrada/`. Funciona, mas manda os 344 MB numa única requisição; prefira o comando acima pro lote inicial e deixe a UI pros lotes do dia a dia.
+4. **Acompanhar**: o próprio comando mostra o progresso arquivo a arquivo. Estimativa: 657 páginas de OCR a ~5 s cada (medido num Ryzen 5 5600X), algo como **1–2 h** na VPS. O resto (pdftotext + regex) leva minutos. O worker tem teto de 4 CPUs e 4 GB, então os outros projetos continuam respondendo.
+5. **Conferir contra o baseline local** antes de dar como pronto. O baseline já sem as duplicatas que os CSVs antigos tinham (medido reextraindo `dados_entrada/` inteira no banco, 2026-09-23): **9.820 faturas** (SANEAGO 9.303) e **63 suspeitos** (40 IPAMERI, 21 SANEAGO, 1 SAAE_CORUMBA, 1 SAE). Diferença pequena é esperada: o texto é regerado no Linux (Tesseract 5.5 / poppler 25 da imagem), e no teste local regerar o texto já mudou o borderô SANEAGO de JULHO/2026 (ganha o mês de referência, 15 suspeitos a mais). Diferença grande indica falha de identificação por pasta — confira os arquivos com erro no fim do relatório do comando.
 6. Só depois de 5 **e** do teste de restore (seção 8): apagar as saídas locais.
+7. **Depois de corrigir um extrator** (daqui pra frente): `docker exec -it <app>-faturas-worker-1 python Main.py --reprocessar-banco [--empresa SAE]` — só reextrai as faturas daquela distribuidora, guardando a versão anterior no histórico.
 
 ## 10. Deploys seguintes e manutenção
 

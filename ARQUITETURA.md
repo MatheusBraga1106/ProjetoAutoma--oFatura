@@ -4,23 +4,33 @@ Este documento explica como o repositório está organizado, o que cada parte fa
 
 ## Visão geral
 
-O projeto tem dois jeitos de rodar o mesmo pipeline de extração de faturas:
+O projeto tem três pontos de entrada para o mesmo pipeline de extração de faturas:
 
-1. **CLI** (`Main.py`) — varre uma pasta local (`dados_entrada/`) recursivamente e processa tudo que encontrar.
+1. **CLI** (`Main.py`) — reextração/manutenção em lote: processa uma pasta (`--pasta`) ou um prefixo do storage (`--s3-prefixo`), reprocessa o que mudou (`--reprocessar-banco`), recalcula derivados (`--recalcular`) e exporta CSV (`--exportar-csv`).
 2. **Web** (`api.py` + `templates/` + `static/`) — upload de arquivos/pastas pelo navegador, com progresso em tempo real e telas pra explorar o que já foi consolidado.
+3. **Worker** (`worker.py`) — processa a fila de jobs criada pela web (ou pelo `Main.py --enfileirar`).
 
-Os dois **compartilham a mesma lógica de negócio** através de `pipeline.py`. Isso é a decisão arquitetural mais importante do repositório: antes da interface web existir, `Main.py` e `api.py` tinham cada um sua própria cópia (levemente divergente) do roteamento, do cruzamento de dados e da gravação em CSV — o que já causou bugs reais (ver seção "Bugs corrigidos" mais abaixo). Qualquer mudança nessa lógica central deve ser feita em `pipeline.py`, nunca duplicada de volta pros dois pontos de entrada.
+Os três **compartilham a mesma lógica** através de `pipeline.py` (roteamento, extratores, cruzamento, enriquecimento, suspeitas) e de `ingestao.py` (gravação no banco, deduplicação, versões, jobs). Isso é a decisão arquitetural mais importante do repositório: antes, `Main.py` e `api.py` tinham cada um sua própria cópia (levemente divergente) do roteamento, do cruzamento de dados e da gravação — o que já causou bugs reais. Qualquer mudança nessa lógica central vai em `pipeline.py`/`ingestao.py`, nunca duplicada nos pontos de entrada.
 
 ```
-                    ┌─────────────┐
-                    │ pipeline.py │  ← lógica compartilhada
-                    └──────┬──────┘
-              ┌────────────┴────────────┐
-        ┌─────▼─────┐              ┌────▼────┐
-        │  Main.py  │              │ api.py  │
-        │   (CLI)   │              │  (web)  │
-        └───────────┘              └─────────┘
+                ┌─────────────┐    ┌──────────────┐
+                │ pipeline.py │ ←─ │  ingestao.py │ ──→ banco (Postgres/SQLite) + storage S3
+                └─────────────┘    └──────┬───────┘
+              ┌────────────────────┬──────┴─────────────┐
+        ┌─────▼─────┐        ┌─────▼─────┐        ┌─────▼─────┐
+        │  Main.py  │        │  api.py   │  jobs  │ worker.py │
+        │   (CLI)   │        │   (web)   │ ─────→ │  (fila)   │
+        └───────────┘        └───────────┘        └───────────┘
 ```
+
+## Persistência (banco + storage)
+
+- **Onde fica cada coisa**: PDFs e textos extraídos num storage S3 (em produção, o Silo no próprio Dokploy; em dev, sem `S3_BUCKET`, uma pasta local); faturas e jobs num banco (Postgres em produção; sem `DATABASE_URL`, SQLite em `dados_saida/faturas.db`, só pra dev/testes). CSV não é mais fonte de verdade — é exportação gerada do banco. Decisão e alternativas em `docs/decisao-armazenamento.md`; schema em `banco/modelos.py`.
+- **Arquivo duplicado**: identidade pelo SHA-256 do conteúdo. O mesmo PDF nunca é guardado duas vezes, mas todos os caminhos pelos quais ele chegou ficam em `arquivo_origens` (o caminho/pasta é o que identifica a distribuidora).
+- **Fatura duplicada**: chave natural normalizada `empresa|NUM_FATURA|MES_ANO_REF|CONTA_DV`. Chave incompleta nunca some nem se funde com outro arquivo — fica presa ao arquivo de origem e ganha `ALERTA_CHAVE`.
+- **Reextração**: a versão de cada extrator é o hash do arquivo-fonte dele (`pipeline.versao_extrator`). Corrigiu um extrator → `python Main.py --reprocessar-banco --empresa X` reextrai só aquela distribuidora e guarda a versão anterior em `fatura_versoes`. Reenviar o mesmo arquivo sem mudança de código não gera trabalho nenhum.
+- **Jobs**: tabela `jobs` + `job_arquivos` + `job_eventos` (o SSE da UI lê daqui). O worker reserva job com `FOR UPDATE SKIP LOCKED` + atualização condicional, mantém heartbeat, e job órfão (worker morto) é retomado de onde parou. Sobrevive a restart.
+- **Limites** (upload web e OCR): 100 MB por arquivo (`UPLOAD_MAX_MB`; maior fatura real: 26 MB) e 40 Mpx por página rasterizada (`OCR_LIMITE_PIXELS_PAGINA`; acima disso a página é lida com DPI menor, em vez de recusada).
 
 ## Estrutura de pastas
 
@@ -28,7 +38,10 @@ Os dois **compartilham a mesma lógica de negócio** através de `pipeline.py`. 
 .
 ├── Main.py                  # Ponto de entrada CLI — varre dados_entrada/
 ├── api.py                   # Ponto de entrada web — FastAPI, serve a UI e a API
-├── pipeline.py               # Lógica compartilhada (roteamento, merges, CSV)
+├── pipeline.py               # Lógica compartilhada (roteamento, merges, suspeitas, versão do extrator)
+├── ingestao.py               # Gravação no banco: dedup, versões, jobs, cruzamento entre lotes
+├── worker.py                 # Processa a fila de jobs (python worker.py)
+├── banco/                    # Modelos SQLAlchemy, sessão, storage S3/local, migração (python -m banco.migrar)
 ├── extratores/                # Um parser por distribuidora + fallbacks de texto
 │   ├── saneago.py
 │   ├── saneago_analitica.py
@@ -74,7 +87,7 @@ Tanto `Main.py` quanto `api.py` seguem a mesma sequência, só muda de onde vêm
 5. **Enriquecimento via `contas.json`** — `pipeline.enriquecer_com_contas_json`. Cruza pela conta (usando `normalizar_conta_dv`, que tira separador/zeros à esquerda pra não depender do extrator ter formatado a conta igual ao JSON) e traz `UNIDADE JUDICIÁRIA`, `ENDEREÇO`, `DISTRIBUIDORA` e as flags `AGUA`/`ESGOTO`/`SMRSU`. Essas flags decidem `corrigir_distribuicao_financeira`: zera um valor que caiu numa categoria que a conta não tem cadastrada (nunca desloca valor entre categorias — isso é trabalho do extrator, não do enriquecimento).
 6. **Filtro de linhas vazias** — `pipeline.filtrar_linhas_vazias` descarta blocos residuais sem fatura/valor/consumo (efeito colateral do corte "à tesoura" de alguns extratores).
 7. **Marcação de suspeitas** — `pipeline.marcar_suspeitas` sinaliza (`SUSPEITO=True`) quando `ÁGUA+ESGOTO+TAXAS` diverge do `TOTAL` em mais de 5 centavos, ou taxas saem negativas. Não corrige nada, só avisa — dá pra ver essas linhas na aba Dados/Dashboards.
-8. **Gravação incremental** — `pipeline.salvar_incremental` grava em `dados_saida/banco_dados_<empresa>.csv`, ignorando faturas já salvas (chave `NUM_FATURA|MES_ANO_REF|CONTA_DV`) e realinhando as colunas do lote novo contra o cabeçalho já existente no CSV (trava contra desalinhamento se algum passo anterior mudar o conjunto de colunas produzidas — ex.: rodar sem `contas.json` presente).
+8. **Gravação no banco** — `ingestao.py` grava cada arquivo numa transação só: faturas pela chave natural (dedup), versão nova com histórico quando o resultado mudou, e o texto extraído no storage (cache, pra não refazer OCR). Ver "Persistência" acima.
 
 ## `Main.py` (CLI)
 
@@ -92,29 +105,27 @@ Serve a UI (`GET /`, `templates/index.html` + `static/`) e expõe:
 |---|---|
 | `GET /health`, `GET /manifest` | Healthcheck e metadados do serviço |
 | `POST /extrair` | Extração avulsa, sem persistir — usado programaticamente |
-| `POST /pipeline/jobs` | Sobe um lote de PDFs, roda o pipeline completo (passos 1–8) em background, grava em `dados_saida/` |
+| `POST /pipeline/jobs` | Sobe um lote de PDFs pro storage e cria um job na fila (o worker roda os passos 1–8 e grava no banco) |
 | `GET /pipeline/jobs/{id}/eventos` | Progresso do job via **Server-Sent Events** (um evento por arquivo processado) |
 | `GET /pipeline/jobs/{id}` | Snapshot do job (status + resultado agregado) |
 | `GET /pipeline/jobs/{id}/csv/{empresa}` | Baixa o CSV de uma distribuidora após aquele job |
 | `GET /pipeline/status-sistema` | `contas.json` presente? Tesseract/pdftotext resolvidos? Quais extratores existem? — alimenta o banner de aviso da UI |
-| `GET /dados/empresas` | Lista distribuidoras com CSV em `dados_saida/` + contagem de linhas |
-| `GET /dados/{empresa}` | Linhas paginadas (`pagina`, `tamanho_pagina`) + busca (`busca`) de uma distribuidora |
-| `GET /dados/{empresa}/csv` | Baixa o CSV consolidado daquela distribuidora |
+| `GET /dados/empresas` | Lista distribuidoras com faturas no banco + contagem |
+| `GET /dados/{empresa}` | Linhas paginadas (`pagina`, `tamanho_pagina`) + busca (`busca`) + `somente_suspeitas` de uma distribuidora |
+| `GET /dados/{empresa}/csv` | Exporta em CSV as faturas daquela distribuidora (gerado do banco na hora) |
 | `GET /dashboard/resumo` | Agregados pra aba Dashboards: KPIs, valor/suspeitas por empresa, série mensal, top 10 consumo/valor. `?empresa=X` filtra só a série mensal e os top 10 (KPIs e comparação por empresa continuam globais) |
 | `GET /erros`, `POST /erros`, `PATCH /erros/{id}` | Fila de erros reportados pela aba Erros (listar/criar/marcar resolvido) — ver `erros_reportados.py` |
 
-Jobs (`/pipeline/jobs/*`) ficam em memória do processo (`dict` global `JOBS` em `api.py`) — não sobrevive a um restart do servidor nem escala pra múltiplas instâncias. Suficiente pro volume atual (uso único, poucas centenas de PDFs por lote).
-
-A pasta de saída é configurável via env var `DADOS_SAIDA_DIR` (default: `dados_saida/` na raiz do projeto) — pensado pra permitir montar um volume persistente num deploy em nuvem sem mudar código.
+Jobs (`/pipeline/jobs/*`) ficam no banco e sobrevivem a restart. Em produção (Postgres) quem processa é o `worker.py`; com SQLite (dev) a própria API processa numa thread (`WORKER_EMBUTIDO`).
 
 ## A interface web (`templates/` + `static/`)
 
 Uma página só (`index.html`), sem build step (JS vanilla direto, sem bundler/framework), com quatro abas trocadas via `static/app.js` (mostra/esconde `<div class="aba">`, sem recarregar a página):
 
 - **Processar** — upload (arraste PDFs, ou selecione uma pasta inteira via `webkitdirectory`, replicando o walk de pastas do `Main.py`), progresso ao vivo consumindo o SSE de `/pipeline/jobs/{id}/eventos`, e o resumo do lote ao final.
-- **Dados** (`static/dados.js`) — navega os CSVs já consolidados, por distribuidora, com busca e paginação (server-side — a SANEAGO sozinha passa de 8 mil linhas). Cada linha tem um botão "Reportar erro" que troca pra aba Erros com a fatura já pré-preenchida.
+- **Dados** (`static/dados.js`) — navega as faturas do banco, por distribuidora, com busca, filtro "Somente suspeitas" e paginação (server-side — a SANEAGO sozinha passa de 9 mil linhas). Cada linha tem um botão "Reportar erro" que troca pra aba Erros com a fatura já pré-preenchida.
 - **Dashboards** (`static/dashboard.js` + `static/graficos.js`) — KPIs, comparação entre distribuidoras e evolução mensal. Os gráficos são SVG puro desenhado à mão (sem lib externa), seguindo as regras do skill de *dataviz* do projeto: hue sequencial único pra comparar magnitude (nunca uma cor por distribuidora), gráficos de linha de uma métrica só (nunca dois eixos Y), rótulo que só aparece quando cabe (senão vai pro tooltip).
-- **Erros** (`static/erros.js`) — formulário pra reportar um problema numa fatura (distribuidora/fatura/conta/mês-ano + mensagem livre) e a lista dos já reportados, com filtro por status e botão pra marcar resolvido/reabrir. Persistido em `erros_reportados.py` (SQLite local, `erros_reportados.db` — gitignored, mesmo padrão do `hub.db` do projeto irmão `hub-faturas`, sem precisar de Docker/Postgres pra rodar). Não altera nada em `dados_saida/`; é só uma fila de revisão manual.
+- **Erros** (`static/erros.js`) — formulário pra reportar um problema numa fatura (distribuidora/fatura/conta/mês-ano + mensagem livre) e a lista dos já reportados, com filtro por status e botão pra marcar resolvido/reabrir. Persistido em `erros_reportados.py`, no mesmo banco das faturas (tabela `erros_reportados`, ligada à fatura quando a referência bate). Não altera nenhuma fatura; é só uma fila de revisão manual.
 
 `static/estilo.css` define os tokens de cor (claro/escuro via `prefers-color-scheme`) usados tanto pela UI quanto pelos gráficos (`--serie-1` é o azul de referência do skill de dataviz, separado do `--cor-primaria` usado nos botões).
 
@@ -135,12 +146,12 @@ Arquitetura em plugin: cada distribuidora tem um `extrair_<nome>(caminho_txt, ..
 | `contas.exemplo.json` | Sim | Estrutura do cadastro, com dados fictícios |
 | `contas.json` | **Não** | Cadastro real (conta, unidade judiciária, endereço, flags água/esgoto/SMRSU) |
 | `dados_entrada/` | **Não** | PDFs reais das faturas |
-| `dados_saida/` | **Não** | CSVs consolidados (dados reais extraídos) |
+| `dados_saida/` | **Não** | Em dev: `faturas.db` (SQLite) e `armazenamento/` (storage local); CSVs antigos de antes do banco |
 
 ## Docker / deploy
 
-`Dockerfile` empacota `api.py` (FastAPI) com `poppler-utils` (pdftotext) e `tesseract-ocr` (+ pacote de português) instalados via `apt`. Porta configurável via env `PORT` (default 8000). Não inclui `contas.json` nem `dados_entrada/` — isso é responsabilidade de quem faz o deploy (montar como volume, secret, etc.); sem `contas.json`, o pipeline roda igual mas sem enriquecimento (a UI avisa isso no banner de status).
+Uma imagem só (`Dockerfile`: Python 3.12 em Debian trixie, `poppler-utils` + `tesseract-ocr` com português, usuário não-root) roda três papéis no `docker-compose.yml`: migração (`python -m banco.migrar`), app web (`uvicorn api:app`) e worker (`python worker.py`), junto com Postgres 17 e o storage S3 (Silo). Só a app é exposta, pelo domínio do Dokploy. Passo a passo, backups e reextração completa em `docs/deploy-dokploy.md`; decisão de armazenamento em `docs/decisao-armazenamento.md`.
 
 ## O que fica pra próxima fase
 
-A revisão sistemática de cada `extrair_*` (precisão de regex, casos de borda de formato de data/valor, otimização do fallback OCR) é um trabalho separado, ainda não feito — o que existe hoje em `pipeline.py` são travas *genéricas* (não específicas de extrator) contra os efeitos mais graves dos bugs já encontrados: `normalizar_conta_dv` pro cruzamento com `contas.json`, `filtrar_linhas_vazias` pras linhas residuais, `marcar_suspeitas` pra sinalizar valores que não fecham, e o realinhamento de colunas em `salvar_incremental`. Nenhuma dessas travas corrige a extração em si — elas dão visibilidade e evitam que dado ruim se espalhe silenciosamente, até a extração de cada distribuidora ser revisada a fundo.
+Ver `PROXIMOS_PASSOS.md`: primeiro deploy e reextração completa no servidor, os suspeitos restantes, e os extratores que ainda faltam (CHESP, SANESC, São Simão, Leopoldo de Bulhões) ou que não reconhecem nenhum dado (DEMAE Panamá).

@@ -9,30 +9,36 @@ Ferramenta em Python para extrair, estruturar e consolidar dados de faturas de �
 1. **Conversão** — `conversor-pdfs.sh` converte as faturas de PDF para texto.
 2. **Roteamento inteligente** — `Main.py` varre as pastas de entrada e identifica automaticamente qual distribuidora emitiu cada fatura (por nome de arquivo/pasta).
 3. **Extração** — cada distribuidora tem um parser dedicado em `extratores/`, responsável por interpretar o layout específico daquela fatura e extrair os campos relevantes (consumo, valores, datas, hidrômetro etc).
-4. **Consolidação** — os dados extraídos de todas as faturas são organizados em DataFrames (pandas) por distribuidora e exportados para CSV, prontos para análise.
+4. **Consolidação** — as faturas extraídas vão para um banco de dados (Postgres em produção), com deduplicação por conteúdo do arquivo e histórico de versões quando um extrator é corrigido. CSV por distribuidora continua disponível como exportação.
 
 ## Distribuidoras suportadas
 
 SANEAGO, SAE, CODEGO, Águas de Ipameri, Buriti Alegre Ambiental, DEMAE, SAAE Abadiânia, SAAE Corumbá, SAAE Mineiros.
 
-Arquitetura modular: adicionar uma nova distribuidora é criar um novo parser em `extratores/` e registrar seu padrão de identificação no roteador em `Main.py`.
+Arquitetura modular: adicionar uma nova distribuidora é criar um novo parser em `extratores/` e registrar seu padrão de identificação e sua função em `pipeline.py`.
 
 ## Interface web
 
-Além do modo CLI (`Main.py`, varrendo `dados_entrada/`), há uma interface web que dispara o mesmo pipeline completo (identificação → pdftotext → fallback OCR → extração → cruzamento SANEAGO/analítica → enriquecimento via `contas.json` → consolidação em CSV) a partir de upload de arquivos ou de uma pasta inteira, com progresso em tempo real.
+Upload de arquivos ou de uma pasta inteira, com progresso em tempo real, navegação das faturas (com filtro de suspeitas), dashboards e uma aba para reportar erros de extração. O pipeline completo (identificação → pdftotext → fallback OCR → extração → cruzamento SANEAGO/analítica → enriquecimento via `contas.json` → banco) é o mesmo do modo CLI.
+
+Rodando localmente (sem Docker, com SQLite e storage em pasta dentro de `dados_saida/`):
 
 ```
 pip install -r requirements.txt
 uvicorn api:app --reload
 ```
 
-Abra `http://localhost:8000/`. Os CSVs consolidados são gravados no mesmo `dados_saida/` do modo CLI (os dois modos compartilham a lógica de roteamento, cruzamento, enriquecimento e anti-duplicata via `pipeline.py`, então rodar por um ou outro modo não diverge o resultado).
+Abra `http://localhost:8000/`. Reextração em lote de uma pasta: `python Main.py --pasta dados_entrada/` (`python Main.py --help` para as outras opções).
 
-> O acompanhamento de progresso (`/pipeline/jobs/*`) guarda o estado dos jobs em memória do processo — não sobrevive a um restart do servidor nem escala para múltiplas instâncias. Suficiente para o volume atual (uso único, poucas centenas de PDFs por lote); revisitar se o projeto crescer para processamento concorrente/distribuído.
+## Produção (Dokploy)
+
+`docker-compose.yml` sobe Postgres, storage S3, a app e o worker de processamento. Passo a passo em [`docs/deploy-dokploy.md`](docs/deploy-dokploy.md); detalhes técnicos em [`ARQUITETURA.md`](ARQUITETURA.md).
 
 ## Stack
 
-- Python (FastAPI, pandas, unicodedata, regex)
+- Python (FastAPI, pandas, SQLAlchemy, regex)
+- Postgres (dados tratados) + storage S3-compatível (PDFs)
+- Tesseract (OCR) e poppler/pdftotext
 - Jinja2 + JS vanilla (interface web, sem build step)
 - Shell script para pré-processamento de PDFs
 
