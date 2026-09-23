@@ -3,31 +3,35 @@
 Passo a passo para colocar o extrator no ar na VPS Hetzner. O porquê de cada escolha está em [`decisao-armazenamento.md`](decisao-armazenamento.md). O que sobe (tudo em `docker-compose.yml`):
 
 ```
-Internet ─HTTPS─> Traefik (Dokploy) ─dokploy-network─> faturas-app :8000
-                                                          │
-                          rede "interno" (internal: true) │
-   faturas-worker ──────────────┬─────────────────────────┤
-                                ▼                         ▼
-                    faturas-db :5432            faturas-storage :9000 (S3) / :9001 (console)
+Internet ─HTTP─> IP-DA-VPS:APP_PORTA (8090) ─rede "publico"─> faturas-app :8000  (usuário/senha)
+                                                                 │
+                                 rede "interno" (internal: true) │
+   faturas-worker ─────────────────────┬─────────────────────────┤
+                                       ▼                         ▼
+                           faturas-db :5432            faturas-storage :9000 (S3) / :9001 (console)
    one-shots a cada deploy: faturas-storage-init (bucket + usuário S3)  e  faturas-migrar (python -m banco.migrar)
 ```
 
-Nenhum serviço publica porta no host. Só a UI sai, e sai pelo domínio.
+Sem domínio: a UI é acessada por `http://IP-DA-VPS:8090`. É o único serviço que publica porta no host, e pede usuário e senha (`APP_USUARIO`/`APP_SENHA`). Banco e storage nunca saem da rede interna.
+
+> **Sem HTTPS.** Sem domínio não há certificado, então a senha e as faturas trafegam em HTTP puro. Serve pra fase de teste; pra reduzir a exposição, restrinja a porta na firewall da Hetzner (seção 5). Quando houver um domínio, dá pra voltar pro Traefik com HTTPS.
 
 ## 0. Pré-requisitos
 
 - [ ] A camada de persistência já está no repositório: `banco/migrar.py`, `worker.py` e as dependências no `requirements.txt` (`sqlalchemy`, `psycopg[binary]`, `boto3`). Sem isso, `faturas-migrar` falha e **nada sobe**, e esse é o comportamento esperado.
-- [ ] Um subdomínio (ex.: `faturas.<seu-domínio>`) com registro **A** apontando para o IP da VPS.
+- [ ] Uma porta livre na VPS pra UI (default `8090`; já usadas: Toca 5000–5003, Dokploy 3000, Traefik 80/443). Conferir na VPS: `ss -ltnp | grep 8090` não pode devolver nada.
 - [ ] Dokploy atualizado (testado contra a documentação e o código da v0.30.x).
 - [ ] Se builds de outros projetos na VPS já funcionam, o DNS do Docker está ok. Se o build travar em `apt-get`/`pip` com "could not resolve host", é o problema conhecido dos resolvers da Hetzner. A correção é adicionar `"dns": ["1.1.1.1", "8.8.8.8"]` em `/etc/docker/daemon.json` e reiniciar o Docker ([doc do Dokploy](https://docs.dokploy.com/docs/core/troubleshooting/networking)). Reiniciar o Docker reinicia todos os projetos da VPS.
 
 ## 1. Gerar os segredos (na sua máquina)
 
+Já gerados em 2026-09-23 em `C:\Users\mmath\ProjetoFaturas\segredos\dokploy-extrator-agua.env` (fora do git), com o bloco completo do passo 3 pronto pra colar. Pra gerar de novo:
+
 ```powershell
-py -c "import secrets; [print(n, secrets.token_hex(24)) for n in ('POSTGRES_PASSWORD','STORAGE_ROOT_PASSWORD','S3_SECRET_KEY')]"
+py -c "import secrets; [print(n, secrets.token_hex(24)) for n in ('POSTGRES_PASSWORD','STORAGE_ROOT_PASSWORD','S3_SECRET_KEY','APP_SENHA')]"
 ```
 
-Hex puro (`0-9a-f`) é de propósito: a senha do Postgres entra no meio do `DATABASE_URL`, e `@ : / ? #` quebrariam a URL. Guarde os três num gerenciador de senhas.
+Hex puro (`0-9a-f`) é de propósito: a senha do Postgres entra no meio do `DATABASE_URL`, e `@ : / ? #` quebrariam a URL. Guarde o arquivo num lugar seguro.
 
 ## 2. Criar o projeto e o serviço
 
@@ -36,11 +40,11 @@ Hex puro (`0-9a-f`) é de propósito: a senha do Postgres entra no meio do `DATA
    - Compose Type: **Docker Compose**, não *Stack*. O modo Stack não suporta `build:`.
    - Provider: GitHub (o mesmo acesso já usado no FindBus), repositório `MatheusBraga1106/ProjetoAutoma--oFatura`, branch `main`.
    - Compose Path: `./docker-compose.yml`.
-3. **Não** ative *Isolated Deployments* nem *Randomize*. O compose já isola banco e storage na rede `interno`, e os nomes `faturas-*` evitam colisão de DNS na `dokploy-network`.
+3. **Não** ative *Isolated Deployments* nem *Randomize*. O compose já isola banco e storage na rede `interno`.
 
 ## 3. Variáveis de ambiente
 
-Aba **Environment**: copie o `.env.example` inteiro e preencha com os valores reais:
+Aba **Environment**: cole o conteúdo inteiro de `dokploy-extrator-agua.env` (passo 1). O formato é:
 
 ```
 POSTGRES_DB=faturas
@@ -54,6 +58,9 @@ S3_BUCKET=faturas-agua
 S3_REGION=us-east-1
 PORT=8000
 TESSERACT_CMD=
+APP_USUARIO=faturas
+APP_SENHA=<hex do passo 1>
+APP_PORTA=8090
 ```
 
 `DATABASE_URL`, `S3_ENDPOINT_URL` e `CONTAS_JSON_PATH` **não** vão aqui. O compose monta esses três. Se faltar alguma obrigatória, o deploy falha com `required variable X is missing a value: defina X`.
@@ -74,19 +81,16 @@ TESSERACT_CMD=
 
 **Se pular este passo**, o Docker cria um *diretório* vazio chamado `contas.json` e o enriquecimento quebra. Para consertar: apague o diretório no host (`rm -r /etc/dokploy/compose/<appName>/files/contas.json`), crie o File Mount e faça redeploy.
 
-## 5. Domínio
+## 5. Acesso por IP:porta (sem domínio) e firewall
 
-Aba **Domains → Add Domain**:
+**Não** adicione nada na aba **Domains**: a porta já é publicada pelo próprio compose (`ports: "${APP_PORTA}:8000"` no `faturas-app`).
 
-| Campo | Valor |
-|---|---|
-| Service Name | `faturas-app` |
-| Host | `faturas.<seu-domínio>` |
-| Path | `/` |
-| Container Port | `8000` |
-| HTTPS | ligado, Certificate: Let's Encrypt |
+A porta fica aberta pra internet inteira. O `ufw` da VPS **não** protege: o Docker publica porta por cima dele. Quem restringe é a **firewall da Hetzner Cloud** (console da Hetzner → Firewalls):
 
-O Dokploy injeta as labels do Traefik e a `traefik.docker.network=dokploy-network` nesse serviço. Com **Preview Compose** dá para ver o arquivo final antes de subir. Não adicione domínio para nenhum outro serviço.
+- regra de entrada TCP `8090` só a partir do seu IP (ou faixa do seu provedor, se o IP mudar);
+- não esqueça das portas que os outros projetos precisam (Toca: 5000/tcp, 5001/udp, 5002/tcp, 5003/tcp; SSH 22; Dokploy 3000 idealmente também só do seu IP).
+
+Se preferir não restringir por IP agora, a senha (`APP_SENHA`, 32 caracteres aleatórios) é a única proteção — por isso ela é obrigatória.
 
 ## 6. Primeiro deploy
 
@@ -105,17 +109,23 @@ Se o passo 3 ou o 4 falhar, app e worker não sobem. Veja o log do one-shot que 
 Pela sua máquina:
 
 ```bash
-curl -fsS https://faturas.<seu-domínio>/health
-# {"status":"ok"}
+curl -fsS http://IP-DA-VPS:8090/health
+# {"status":"ok"}   (sem senha, de propósito)
 
-curl -fsS https://faturas.<seu-domínio>/pipeline/status-sistema
-# esperar: contas.json presente, tesseract_resolvido=true, pdftotext_resolvido=true
+curl -fsS http://IP-DA-VPS:8090/pipeline/status-sistema
+# 401 — sem senha não entra
+
+curl -fsS -u "faturas:<APP_SENHA>" http://IP-DA-VPS:8090/pipeline/status-sistema
+# esperar: contas_json_encontrado=true, tesseract_resolvido=true, pdftotext_resolvido=true,
+#          banco=postgresql, armazenamento=s3, armazenamento_erro=null, worker_embutido=false
 ```
+
+No navegador, `http://IP-DA-VPS:8090` pede usuário e senha uma vez por sessão.
 
 **Teste de OCR de ponta a ponta.** `POST /extrair` extrai e devolve JSON sem persistir. Use uma fatura que **só funciona por OCR** (as da BURITI ALEGRE são escaneadas, com ~5 s por página):
 
 ```bash
-curl -fsS -X POST https://faturas.<seu-domínio>/extrair \
+curl -fsS -u "faturas:<APP_SENHA>" -X POST http://IP-DA-VPS:8090/extrair \
   -F "arquivos=@FATURA Nº 185278 - BURITI ALEGRE AMBIENTAL - JANEIRO.2025.pdf"
 # esperar status "ok" com valor_total preenchido; "erro" = OCR/extrator com problema
 ```
@@ -210,9 +220,10 @@ A reextração é feita pelo `Main.py` (`python Main.py --help` lista as opçõe
 
 | Sintoma | Causa provável |
 |---|---|
-| `network dokploy-network declared as external, but could not be found` | Deploy fora de um host Dokploy. Na VPS essa rede sempre existe |
+| `Bind for 0.0.0.0:8090 failed: port is already allocated` | Outro projeto já usa a porta. Troque `APP_PORTA` no Environment e faça redeploy |
 | App e worker não sobem, `faturas-migrar` com exit ≠ 0 | Erro de migração ou `DATABASE_URL`. Veja o log do `faturas-migrar` |
 | `faturas-storage-init` falha em `alias set` | `STORAGE_ROOT_*` diferente do usado na **primeira** subida do volume do storage |
 | Enriquecimento vazio / erro lendo `contas.json` | File Mount não criado, e o Docker criou um diretório (ver seção 4) |
 | Worker *unhealthy* | Postgres fora do ar, ou o Tesseract perdeu o `por` (imagem errada). Veja o `docker inspect` do healthcheck |
-| 404 / certificado inválido no domínio | Registro A ainda não propagou, ou domínio ligado a outro serviço que não o `faturas-app` |
+| `http://IP:8090` não abre (timeout) | Firewall da Hetzner sem a regra da porta, ou regra restrita a um IP que não é o seu atual |
+| O navegador pede senha sem parar | `APP_USUARIO`/`APP_SENHA` digitados diferentes do Environment; o usuário também diferencia maiúsculas |

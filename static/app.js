@@ -197,12 +197,44 @@
         });
 
         eventSource.onerror = () => {
-            // Conexão caiu antes do evento "concluido"/"erro" (ex.: job sumiu
-            // do processo). Encerra silenciosamente pra não travar a UI.
+            // Queda de rede/proxy: o navegador reconecta sozinho e o servidor
+            // continua do último evento (Last-Event-ID). Só se a conexão for
+            // encerrada de vez é que consultamos o estado final do job.
+            if (eventSource.readyState === EventSource.CONNECTING) {
+                textoProgresso.textContent = `${processados} / ${totalArquivos} arquivos — reconectando…`;
+                return;
+            }
             eventSource.close();
-            botaoProcessar.disabled = false;
-            botaoLimpar.disabled = false;
+            consultarJobFinal(jobId, totalArquivos);
         };
+    }
+
+    async function consultarJobFinal(jobId, totalArquivos) {
+        try {
+            const resposta = await fetch(`/pipeline/jobs/${jobId}`);
+            if (resposta.ok) {
+                const job = await resposta.json();
+                if (job.status === "concluido" && job.resultado) {
+                    barraPreenchida.style.width = "100%";
+                    textoProgresso.textContent = `${totalArquivos} / ${totalArquivos} arquivos — concluído`;
+                    renderizarResultados(jobId, job.resultado);
+                } else if (job.status === "erro") {
+                    mostrarStatusUpload("Erro no processamento: " + ((job.resultado && job.resultado.erro) || "desconhecido"), "erro");
+                } else {
+                    // Ainda processando no servidor: volta a acompanhar
+                    // (a conexão nova recebe tudo de novo desde o começo).
+                    ulProgresso.innerHTML = "";
+                    acompanharJob(jobId, totalArquivos);
+                    return;
+                }
+            } else {
+                mostrarStatusUpload("A conexão com o servidor caiu e não foi possível consultar o processamento.", "erro");
+            }
+        } catch (erro) {
+            mostrarStatusUpload("A conexão com o servidor caiu: " + erro, "erro");
+        }
+        botaoProcessar.disabled = false;
+        botaoLimpar.disabled = false;
     }
 
     function renderizarResultados(jobId, resultado) {

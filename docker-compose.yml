@@ -10,12 +10,13 @@
 #   faturas-storage       S3 self-hosted (Silo = fork mantido do MinIO)
 #   faturas-storage-init  one-shot: cria bucket + usuário S3 restrito (idempotente)
 #   faturas-migrar        one-shot: python -m banco.migrar (idempotente)
-#   faturas-app           UI + API (uvicorn) — ÚNICO serviço exposto, via domínio do Dokploy
+#   faturas-app           UI + API (uvicorn) — ÚNICO serviço exposto, em IP:APP_PORTA
+#                         (sem domínio), protegido por usuário/senha (APP_USUARIO/APP_SENHA)
 #   faturas-worker        python worker.py (fila = tabela jobs no Postgres)
 #
-# Só faturas-app está na dokploy-network (é por ela que o Traefik chega).
-# Banco e storage ficam só na rede "interno" (internal: true = sem saída
-# pra internet e inalcançável por outros projetos). Nenhum "ports:".
+# Só faturas-app publica porta (rede "publico"). Banco e storage ficam só na
+# rede "interno" (internal: true = sem saída pra internet e inalcançável por
+# outros projetos).
 #
 # Variáveis: vêm do .env que o Dokploy gera a partir da aba Environment
 # (modelo em .env.example). As obrigatórias usam ${VAR:?...} pra o deploy
@@ -40,6 +41,10 @@ x-imagem-extrator: &imagem-extrator
     CONTAS_JSON_PATH: /app/contas.json
     PORT: ${PORT:-8000}
     TESSERACT_CMD: ${TESSERACT_CMD:-}
+    # Senha de acesso à UI/API (Basic Auth). Obrigatória: a app é acessada
+    # por IP:porta, sem domínio nem proxy na frente.
+    APP_USUARIO: ${APP_USUARIO:?defina APP_USUARIO}
+    APP_SENHA: ${APP_SENHA:?defina APP_SENHA}
   volumes:
     # File Mount do Dokploy (Advanced -> Mounts -> File Mount "contas.json").
     # Criar ANTES do primeiro deploy: se não existir, o Docker cria um
@@ -168,11 +173,13 @@ services:
         condition: service_healthy
       faturas-storage:
         condition: service_healthy
-    expose:
-      - "8000"
+    # Acesso por http://IP-DA-VPS:APP_PORTA (sem domínio). O Docker publica a
+    # porta por cima do ufw — quem restringe é a firewall da Hetzner Cloud.
+    ports:
+      - "${APP_PORTA:-8090}:8000"
     networks:
       - interno
-      - dokploy-network
+      - publico
     deploy:
       resources:
         limits:
@@ -223,5 +230,6 @@ volumes:
 networks:
   interno:
     internal: true
-  dokploy-network:
-    external: true
+  # Rede comum só pra app: numa rede internal: true o Docker não consegue
+  # publicar a porta. Banco e storage continuam só na "interno".
+  publico: {}

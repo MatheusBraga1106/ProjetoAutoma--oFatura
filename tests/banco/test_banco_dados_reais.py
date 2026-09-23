@@ -4,6 +4,7 @@ temporário, com os extratores reais, e compara contagem/total/suspeitas com
 as linhas do CSV atual produzidas pelo Main.py para os mesmos arquivos.
 Pulado se os dados reais não estiverem presentes. Não imprime conteúdo."""
 
+import glob
 import os
 import unicodedata
 
@@ -12,13 +13,17 @@ import pytest
 
 RAIZ = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENTRADA = os.path.join(RAIZ, "dados_entrada")
-SAIDA = os.path.join(RAIZ, "dados_saida")
+# CSVs de referência (saída do Main.py antigo). Desde a migração pro banco
+# eles não ficam mais em dados_saida/: extraia o backup e aponte pra pasta,
+# ex.: BASELINE_CSV_DIR=<pasta>/dados_saida
+SAIDA = os.environ.get("BASELINE_CSV_DIR") or os.path.join(RAIZ, "dados_saida")
 CONTAS = os.path.join(RAIZ, "contas.json")
 POR_EMPRESA = int(os.environ.get("AMOSTRA_POR_DISTRIBUIDORA", "4"))
 
 pytestmark = pytest.mark.skipif(
-    not (os.path.isdir(ENTRADA) and os.path.isdir(SAIDA) and os.path.exists(CONTAS)),
-    reason="dados reais ausentes",
+    not (os.path.isdir(ENTRADA) and os.path.exists(CONTAS)
+         and glob.glob(os.path.join(SAIDA, "banco_dados_*.csv"))),
+    reason="dados reais ou CSVs de referência ausentes (defina BASELINE_CSV_DIR)",
 )
 
 

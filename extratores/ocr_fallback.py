@@ -20,6 +20,9 @@ DPI_PADRAO = 400
 # página fisicamente gigante as letras também são, então lê bem com menos DPI.
 # A4 a 400 DPI = 15,5 Mpx, bem abaixo do teto — faturas normais não mudam.
 LIMITE_PIXELS_PAGINA = int(os.environ.get("OCR_LIMITE_PIXELS_PAGINA", 40_000_000))
+# Uma página real leva ~5 s (até ~10 s perto do teto de pixels). Acima disto
+# o Tesseract travou: a fatura vira erro em vez de segurar o worker pra sempre.
+TIMEOUT_PAGINA_SEGUNDOS = int(os.environ.get("OCR_TIMEOUT_PAGINA_SEGUNDOS", 180))
 Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS or 0, int(LIMITE_PIXELS_PAGINA * 1.1))
 PSM_PADRAO = 4  # "assume uma única coluna de texto de tamanhos variados"
 IDIOMA_PADRAO = "por"
@@ -152,7 +155,7 @@ def ocr_pdf(caminho_pdf, dpi=DPI_PADRAO, psm=PSM_PADRAO, lang=IDIOMA_PADRAO, cal
         modo = "RGB" if pix.n == 3 else "L" if pix.n == 1 else "RGBA"
         img = Image.frombytes(modo, (pix.width, pix.height), pix.samples)
         del pix
-        texto = pytesseract.image_to_string(img, lang=lang, config=config)
+        texto = pytesseract.image_to_string(img, lang=lang, config=config, timeout=TIMEOUT_PAGINA_SEGUNDOS)
         paginas_texto.append(texto)
         if callback_pagina:
             callback_pagina(i + 1, doc.page_count)

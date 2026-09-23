@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hmac
 import json
 import os
 import shutil
@@ -11,6 +13,7 @@ from typing import List
 
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -70,6 +73,32 @@ async def ciclo_de_vida(_app: FastAPI):
 
 
 app = FastAPI(title="Extrator de Faturas de Água", lifespan=ciclo_de_vida)
+
+
+# Acesso por IP:porta, sem domínio nem proxy na frente: sem isto qualquer um
+# que achar a porta vê as faturas e o cadastro de contas. Ligado quando
+# APP_SENHA está definida (o docker-compose exige). /health fica livre pro
+# HEALTHCHECK do Docker.
+APP_USUARIO = os.environ.get("APP_USUARIO", "")
+APP_SENHA = os.environ.get("APP_SENHA", "")
+
+
+@app.middleware("http")
+async def autenticacao_basica(request: Request, call_next):
+    if not APP_SENHA or request.url.path == "/health":
+        return await call_next(request)
+    cabecalho = request.headers.get("authorization", "")
+    if cabecalho.lower().startswith("basic "):
+        try:
+            usuario, _, senha = base64.b64decode(cabecalho[6:]).decode("utf-8").partition(":")
+        except (ValueError, UnicodeDecodeError):
+            usuario, senha = "", ""
+        usuario_ok = hmac.compare_digest(usuario.encode(), APP_USUARIO.encode())
+        senha_ok = hmac.compare_digest(senha.encode(), APP_SENHA.encode())
+        if usuario_ok and senha_ok:
+            return await call_next(request)
+    return Response(status_code=401, content="Autenticação necessária.",
+                    headers={"WWW-Authenticate": 'Basic realm="Extrator de Faturas", charset="UTF-8"'})
 
 
 @app.middleware("http")
@@ -186,7 +215,8 @@ def extrair(arquivos: List[UploadFile] = File(...)):
                 resultados.append({
                     "arquivo_origem": arquivo.filename,
                     "status": "erro",
-                    "erro": str(e),
+                    # Sem o caminho temporário interno do servidor na resposta.
+                    "erro": ingestao.sem_caminho_interno(str(e), subpasta),
                 })
                 continue
 
@@ -290,8 +320,23 @@ def _ler_com_limite(arquivo: UploadFile) -> bytes:
     return b"".join(partes)
 
 
+# O Starlette recusa (400 "Too many files") acima de 1000 arquivos por envio
+# — o acervo atual tem 1.117 PDFs, então "Selecionar pasta" na raiz falhava.
+UPLOAD_MAX_ARQUIVOS = int(os.environ.get("UPLOAD_MAX_ARQUIVOS", "5000"))
+
+
 @app.post("/pipeline/jobs")
-def criar_job(background_tasks: BackgroundTasks, arquivos: List[UploadFile] = File(...)):
+async def criar_job(request: Request, background_tasks: BackgroundTasks):
+    formulario = await request.form(max_files=UPLOAD_MAX_ARQUIVOS, max_fields=UPLOAD_MAX_ARQUIVOS)
+    try:
+        arquivos = [a for a in formulario.getlist("arquivos") if hasattr(a, "filename")]
+        # Leitura/gravação no storage e no banco é bloqueante: fora do event loop.
+        return await run_in_threadpool(_criar_job, background_tasks, arquivos)
+    finally:
+        await formulario.close()
+
+
+def _criar_job(background_tasks: BackgroundTasks, arquivos: List[UploadFile]):
     if not arquivos:
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado.")
 
@@ -351,26 +396,44 @@ def _eventos_desde(job_id: str, ultimo_id: int) -> tuple[list[tuple[int, str, di
     return eventos, status
 
 
+SSE_HEARTBEAT_SEGUNDOS = 15
+
+
 @app.get("/pipeline/jobs/{job_id}/eventos")
-async def eventos_job(job_id: str):
+async def eventos_job(job_id: str, request: Request):
     _obter_job(job_id)
+    # Reconexão: o navegador reenvia o `id:` do último evento que recebeu —
+    # continua dali em vez de repetir tudo desde o evento 1.
+    try:
+        inicio = int(request.headers.get("last-event-id") or 0)
+    except ValueError:
+        inicio = 0
 
     async def streamer():
-        ultimo_id = 0
+        ultimo_id = inicio
+        loop = asyncio.get_running_loop()
+        ultimo_envio = loop.time()
         while True:
             eventos, status = await asyncio.to_thread(_eventos_desde, job_id, ultimo_id)
             for id_evento, tipo, dados in eventos:
                 ultimo_id = id_evento
-                yield f"event: {tipo}\ndata: {json.dumps(dados, ensure_ascii=False)}\n\n"
+                ultimo_envio = loop.time()
+                yield f"id: {id_evento}\nevent: {tipo}\ndata: {json.dumps(dados, ensure_ascii=False)}\n\n"
                 if tipo in ("concluido", "erro"):
                     return
             if status in ("concluido", "erro") and not eventos:
                 # Terminal sem evento terminal (não deveria acontecer): fecha
                 # do mesmo jeito que antes, pra UI não ficar pendurada.
                 return
+            if loop.time() - ultimo_envio >= SSE_HEARTBEAT_SEGUNDOS:
+                # Comentário SSE: mantém a conexão viva atrás de proxy com
+                # timeout de inatividade (uma página de OCR passa de 1 min).
+                ultimo_envio = loop.time()
+                yield ": ping\n\n"
             await asyncio.sleep(0.4)
 
-    return StreamingResponse(streamer(), media_type="text/event-stream")
+    return StreamingResponse(streamer(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/pipeline/jobs/{job_id}/csv/{empresa}")

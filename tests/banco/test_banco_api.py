@@ -164,3 +164,48 @@ def test_upload_acima_do_limite_recusado_sem_criar_job(cliente, monkeypatch):
     assert "limite" in r.json()["detail"]
     with sessao() as s:
         assert s.scalar(select(func.count()).select_from(Job)) == 0
+
+
+def test_sse_manda_id_e_retoma_do_last_event_id(cliente):
+    job_id = _carregar(cliente)
+    ids = []
+    with cliente.stream("GET", f"/pipeline/jobs/{job_id}/eventos") as r:
+        for linha in r.iter_lines():
+            if linha.startswith("id: "):
+                ids.append(int(linha[4:]))
+    assert len(ids) == 4 and ids == sorted(ids)
+
+    # Reconexão depois do 2º evento: só chegam os que faltavam, sem repetir.
+    tipos = []
+    with cliente.stream("GET", f"/pipeline/jobs/{job_id}/eventos",
+                        headers={"Last-Event-ID": str(ids[1])}) as r:
+        for linha in r.iter_lines():
+            if linha.startswith("event: "):
+                tipos.append(linha[7:])
+    assert tipos == ["progresso", "concluido"]
+
+
+def test_envio_com_mais_de_1000_arquivos(cliente):
+    # Limite padrão do Starlette é 1000; o acervo real tem 1.117 PDFs.
+    partes = [("arquivos", (f"AGUA - DEMAE/{i}.pdf", io.BytesIO(b"%PDF-" + str(i).encode()), "application/pdf"))
+              for i in range(1100)]
+    r = cliente.post("/pipeline/jobs", files=partes)
+    assert r.status_code == 200, r.text
+    assert r.json()["total_arquivos"] == 1100
+
+
+def test_autenticacao_basica_quando_senha_definida(cliente, monkeypatch):
+    import api
+
+    assert cliente.get("/dados/empresas").status_code == 200  # sem APP_SENHA: aberto (dev)
+
+    monkeypatch.setattr(api, "APP_USUARIO", "faturas")
+    monkeypatch.setattr(api, "APP_SENHA", "s3nha-teste")
+    r = cliente.get("/dados/empresas")
+    assert r.status_code == 401 and r.headers["www-authenticate"].startswith("Basic")
+    assert cliente.get("/", auth=("faturas", "errada")).status_code == 401
+    assert cliente.get("/dados/empresas", auth=("outro", "s3nha-teste")).status_code == 401
+    assert cliente.get("/dados/empresas", auth=("faturas", "s3nha-teste")).status_code == 200
+    assert cliente.get("/static/app.js", auth=("faturas", "s3nha-teste")).status_code == 200
+    assert cliente.get("/health").status_code == 200  # HEALTHCHECK do Docker sem credencial
+    assert cliente.get("/dados/empresas", headers={"Authorization": "Basic %%%"}).status_code == 401

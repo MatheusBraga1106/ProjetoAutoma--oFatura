@@ -150,7 +150,7 @@ Arquitetura em plugin: cada distribuidora tem um `extrair_<nome>(caminho_txt, ..
 
 ## Docker / deploy
 
-Uma imagem só (`Dockerfile`: Python 3.12 em Debian trixie, `poppler-utils` + `tesseract-ocr` com português, usuário não-root) roda três papéis no `docker-compose.yml`: migração (`python -m banco.migrar`), app web (`uvicorn api:app`) e worker (`python worker.py`), junto com Postgres 17 e o storage S3 (Silo). Só a app é exposta, pelo domínio do Dokploy. Passo a passo, backups e reextração completa em `docs/deploy-dokploy.md`; decisão de armazenamento em `docs/decisao-armazenamento.md`.
+Uma imagem só (`Dockerfile`: Python 3.12 em Debian trixie, `poppler-utils` + `tesseract-ocr` com português, usuário não-root) roda três papéis no `docker-compose.yml`: migração (`python -m banco.migrar`), app web (`uvicorn api:app`) e worker (`python worker.py`), junto com Postgres 17 e o storage S3 (Silo). Só a app é exposta, em `IP-DA-VPS:APP_PORTA` (sem domínio), protegida por usuário/senha (`APP_USUARIO`/`APP_SENHA`, Basic Auth). Passo a passo, backups e reextração completa em `docs/deploy-dokploy.md`; decisão de armazenamento em `docs/decisao-armazenamento.md`.
 
 ## O que fica pra próxima fase
 

@@ -343,6 +343,16 @@ def registrar_evento(s, job_id: str, tipo: str, dados: dict) -> None:
 # Texto do PDF (pdftotext -> OCR), com cache no storage
 # =========================================================
 
+def sem_caminho_interno(mensagem: str, pasta_tmp: str) -> str:
+    """Tira o caminho da pasta temporária de uma mensagem de erro que vai pra
+    UI. Não depende de a exceção escrever o caminho igual ao nosso (barras
+    trocadas, prefixo \\\\?\\ do Windows...): corta até o nome da pasta, que é
+    único (fatura_xxxx), e os separadores seguintes (o PyMuPDF escreve o
+    caminho com barras duplicadas, como num repr)."""
+    nome_pasta = re.escape(os.path.basename(os.path.normpath(pasta_tmp)))
+    return re.sub(r"[^'\"\s]*" + nome_pasta + r"[\\/]*", "", mensagem)
+
+
 def nome_seguro(nome: str) -> str:
     """Nome de arquivo pra pasta temporária. Mantém o nome original (o
     extrator da analítica tira o mês/ano do NOME do arquivo quando o texto
@@ -832,7 +842,8 @@ def processar_item(item_id: int, worker_id: "str | None" = None, opcoes: "Opcoes
                                armazenamento, refazer=opcoes.refazer_texto)
         df = pipeline.EXTRATORES_POR_EMPRESA[empresa](texto.caminho_txt, texto.via_ocr)
     except Exception as e:  # noqa: BLE001 — erro do extrator vira erro do arquivo, não do job
-        return _gravar_item(item, worker_id, empresa, base_evento, erro=str(e) or e.__class__.__name__,
+        return _gravar_item(item, worker_id, empresa, base_evento,
+                            erro=sem_caminho_interno(str(e) or e.__class__.__name__, pasta_tmp),
                             status_arquivo="erro")
     finally:
         shutil.rmtree(pasta_tmp, ignore_errors=True)
@@ -905,7 +916,10 @@ def _gravar_item(item: JobArquivo, worker_id, empresa, base_evento: dict, *, err
                         resultado_item.update(cont)
                         resultado_item.update(info)
                         linhas = len(registros)
-                    resultado_item["linhas"] = linhas
+                    # Contrato da API: "linhas" = o que o extrator devolveu,
+                    # incluindo as descartadas como vazias (linhas_extraidas,
+                    # no banco, guarda só as que ficaram).
+                    resultado_item["linhas"] = linhas + descartadas
                     arquivo.versao_extrator = versao
                     arquivo.texto_sha256_processado = texto.sha256 if texto else arquivo.texto_sha256
                     arquivo.linhas_extraidas = linhas
