@@ -1,20 +1,21 @@
+import asyncio
 import json
 import os
 import shutil
 import sys
 import tempfile
 import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import List, Optional
+from contextlib import asynccontextmanager
+from datetime import timezone
+from typing import List
 
 import pandas as pd
-import pytesseract
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
 # Os extratores originais imprimem emojis de debug (✅❌🔎...) via print().
 # Num console/ambiente cujo stdout não seja UTF-8 (comum no Windows, e
@@ -24,27 +25,51 @@ from pydantic import BaseModel, Field
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from pipeline import (
+import ingestao  # noqa: E402
+from banco.config import caminho_contas_json, pasta_saida, worker_embutido  # noqa: E402
+from banco.modelos import Fatura, Job, JobEvento  # noqa: E402
+from banco.sessao import obter_engine, sessao  # noqa: E402
+from banco.storage import obter_armazenamento  # noqa: E402
+from erros_reportados import atualizar_status, criar_erro, listar_erros  # noqa: E402
+from extratores import ocr_fallback  # noqa: E402
+from extratores.pdftotext_fallback import PDFTOTEXT_CMD  # noqa: E402
+from pipeline import (  # noqa: E402
     EMPRESAS_CONHECIDAS,
     EXTRATORES_NAO_IMPLEMENTADOS,
     EXTRATORES_POR_EMPRESA,
-    PASTA_BASE,
-    carregar_dataframe_empresa,
-    enriquecer_com_contas_json,
-    filtrar_linhas_vazias,
     identificar_distribuidora,
     linha_para_dados,
-    listar_empresas_com_dados,
-    marcar_suspeitas,
     mesclar_saneago_com_analitica,
-    salvar_incremental,
 )
-from extratores.ocr_fallback import eh_texto_util, gerar_txt_via_ocr
-from extratores.pdftotext_fallback import PDFTOTEXT_CMD, converter_pdf_para_txt
-from erros_reportados import atualizar_status, criar_erro, inicializar_db, listar_erros
 
-app = FastAPI(title="Extrator de Faturas de Água")
-inicializar_db()
+
+@asynccontextmanager
+async def ciclo_de_vida(_app: FastAPI):
+    # WORKER_EMBUTIDO (default quando o banco é SQLite, i.e. dev): a própria
+    # API processa a fila numa thread — inclusive jobs que ficaram pela
+    # metade num restart. Em produção (Postgres) quem processa é o
+    # `python worker.py`, e isto fica desligado.
+    # Storage: só confere (head_bucket) — a credencial da app não pode criar
+    # bucket. Falha não derruba a API (a UI/health continuam no ar), mas vai
+    # pro log e pro /pipeline/status-sistema.
+    _app.state.erro_armazenamento = None
+    try:
+        obter_armazenamento().garantir_bucket()
+    except Exception as e:  # noqa: BLE001
+        _app.state.erro_armazenamento = str(e)
+        print(f"[api] ERRO no storage: {e}", file=sys.stderr, flush=True)
+
+    parar = None
+    if worker_embutido():
+        import worker
+
+        _thread, parar = worker.iniciar_embutido()
+    yield
+    if parar is not None:
+        parar.set()
+
+
+app = FastAPI(title="Extrator de Faturas de Água", lifespan=ciclo_de_vida)
 
 
 @app.middleware("http")
@@ -74,26 +99,6 @@ MANIFEST = {
     ],
 }
 
-PASTA_SAIDA_PADRAO = os.path.join(PASTA_BASE, "dados_saida")
-
-
-def pasta_saida() -> str:
-    """Diretório onde os CSVs consolidados são gravados. Configurável via
-    DADOS_SAIDA_DIR pra permitir montar um volume persistente em deploys
-    de nuvem sem mudar código."""
-    return os.environ.get("DADOS_SAIDA_DIR", PASTA_SAIDA_PADRAO)
-
-
-def texto_de(caminho_pdf: str) -> tuple[str, bool]:
-    """Garante um .txt pareado, tentando pdftotext e caindo pro OCR se precisar.
-    Devolve (caminho_txt, veio_de_ocr)."""
-    caminho_txt = os.path.splitext(caminho_pdf)[0] + ".txt"
-    converter_pdf_para_txt(caminho_pdf, caminho_txt)
-    if eh_texto_util(caminho_txt):
-        return caminho_txt, False
-    gerar_txt_via_ocr(caminho_pdf, caminho_txt)
-    return caminho_txt, True
-
 
 def _validar_empresa(empresa: str) -> str:
     """Whitelist contra path traversal — "empresa" costuma vir direto da URL."""
@@ -105,15 +110,19 @@ def _validar_empresa(empresa: str) -> str:
 
 def _texto_ou_vazio(valor) -> str:
     """`valor or ""` não pega NaN (é truthy em Python) — vira float('nan') no
-    dict e quebra o json.dumps da resposta ("Out of range float values are
-    not JSON compliant"). Usa isso pra qualquer campo de texto que pode vir
-    de uma linha de CSV com célula vazia."""
+    dict e quebra o json.dumps da resposta. Usa isso pra qualquer campo de
+    texto que pode vir vazio."""
     return "" if pd.isna(valor) else str(valor)
 
 
-def _caminho_csv_empresa(empresa: str) -> str:
-    empresa = _validar_empresa(empresa)
-    return os.path.join(pasta_saida(), f"banco_dados_{empresa.lower()}.csv")
+def _verdadeiro(valor: "str | None") -> bool:
+    return (valor or "").strip().lower() in ("1", "true", "sim", "yes", "on")
+
+
+def _resposta_csv(conteudo: bytes, empresa: str) -> Response:
+    nome = f"banco_dados_{empresa.lower()}.csv"
+    return Response(content=conteudo, media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{nome}"'})
 
 
 @app.get("/health")
@@ -161,17 +170,17 @@ def extrair(arquivos: List[UploadFile] = File(...)):
                 })
                 continue
 
-            # Nunca usar o nome recebido do cliente pra montar caminho em disco: pode
-            # conter "/" (o chamador tem liberdade de incluir contexto de pasta no nome,
-            # útil pra identificação — ver identificar_distribuidora) ou até ".." — um
-            # nome de arquivo de cliente nunca é confiável como caminho de sistema.
-            extensao = os.path.splitext(arquivo.filename)[1] or ".pdf"
-            caminho_pdf = os.path.join(pasta_tmp, f"{uuid.uuid4().hex}{extensao}")
+            # Nunca usar o nome recebido como caminho: pode ter "/" ou "..".
+            # Uma subpasta opaca por arquivo + nome saneado (o extrator da
+            # analítica lê o mês/ano do NOME do arquivo quando o texto não tem).
+            subpasta = os.path.join(pasta_tmp, uuid.uuid4().hex)
+            os.makedirs(subpasta)
+            caminho_pdf = os.path.join(subpasta, ingestao.nome_seguro(arquivo.filename or "arquivo") + ".pdf")
             with open(caminho_pdf, "wb") as f:
-                f.write(arquivo.file.read())
+                f.write(_ler_com_limite(arquivo))
 
             try:
-                caminho_txt, veio_de_ocr = texto_de(caminho_pdf)
+                caminho_txt, veio_de_ocr = ingestao.extrair_texto_de_pdf(caminho_pdf)
                 df = EXTRATORES_POR_EMPRESA[empresa](caminho_txt, veio_de_ocr)
             except Exception as e:
                 resultados.append({
@@ -216,8 +225,6 @@ def extrair(arquivos: List[UploadFile] = File(...)):
                     "dados": linha_para_dados(linha),
                 })
         elif lotes_analitica:
-            # Sem fatura SANEAGO no mesmo lote pra cruzar — devolve os dados
-            # do hidrômetro isolados mesmo assim (não descarta o arquivo).
             for nome, df in lotes_analitica:
                 for _, linha in df.iterrows():
                     resultados.append({
@@ -230,30 +237,11 @@ def extrair(arquivos: List[UploadFile] = File(...)):
 
 
 # =========================================================
-# PIPELINE COMPLETO (identificação + OCR + extração + cruzamento
-# SANEAGO/analítica + enriquecimento contas.json + persistência
-# incremental) — o mesmo que o Main.py faz varrendo pastas, aqui
-# disparado por upload e acompanhável em tempo real pela UI.
+# PIPELINE COMPLETO — upload vira job persistido (tabela jobs); quem
+# processa é o worker (worker.py, ou a thread embutida em dev). O SSE lê os
+# eventos gravados no banco, então sobrevive a restart e funciona com a API
+# e o worker em processos/containers diferentes.
 # =========================================================
-
-class StatusJob(str, Enum):
-    PENDENTE = "pendente"
-    PROCESSANDO = "processando"
-    CONCLUIDO = "concluido"
-    ERRO = "erro"
-
-
-@dataclass
-class Job:
-    id: str
-    total_arquivos: int
-    status: StatusJob = StatusJob.PENDENTE
-    eventos: list = field(default_factory=list)
-    resultado: Optional[dict] = None
-
-
-JOBS: dict[str, Job] = {}
-
 
 def _comando_resolvido(cmd: str) -> bool:
     if os.path.isabs(cmd):
@@ -261,128 +249,49 @@ def _comando_resolvido(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _registrar_evento(job: Job, tipo: str, dados: dict):
-    job.eventos.append({"tipo": tipo, "dados": dados})
-
-
-def processar_job(job_id: str, pasta_tmp: str, arquivos_info: List[tuple]):
-    job = JOBS[job_id]
-    job.status = StatusJob.PROCESSANDO
-    dados_por_empresa = {empresa: [] for empresa in EMPRESAS_CONHECIDAS}
-    arquivos_resultado = []
-
-    try:
-        for indice, (nome_relativo, caminho_pdf) in enumerate(arquivos_info, start=1):
-            base_evento = {"arquivo": nome_relativo, "indice": indice, "total": job.total_arquivos}
-
-            empresa = identificar_distribuidora(nome_relativo)
-
-            if empresa is None:
-                arquivos_resultado.append({
-                    "arquivo_origem": nome_relativo, "status": "erro",
-                    "erro": "Não foi possível identificar a distribuidora deste arquivo.",
-                })
-                _registrar_evento(job, "progresso", {**base_evento, "status": "erro",
-                                                       "detalhe": "distribuidora não identificada"})
-                continue
-
-            if empresa in EXTRATORES_NAO_IMPLEMENTADOS:
-                arquivos_resultado.append({
-                    "arquivo_origem": nome_relativo, "status": "erro",
-                    "erro": f"Extrator para {empresa} ainda não foi implementado.",
-                })
-                _registrar_evento(job, "progresso", {**base_evento, "status": "erro",
-                                                       "detalhe": f"extrator {empresa} não implementado"})
-                continue
-
-            try:
-                caminho_txt, veio_de_ocr = texto_de(caminho_pdf)
-                df = EXTRATORES_POR_EMPRESA[empresa](caminho_txt, veio_de_ocr)
-            except Exception as e:
-                arquivos_resultado.append({"arquivo_origem": nome_relativo, "status": "erro", "erro": str(e)})
-                _registrar_evento(job, "progresso", {**base_evento, "status": "erro", "detalhe": str(e)})
-                continue
-
-            if df is None or df.empty:
-                arquivos_resultado.append({
-                    "arquivo_origem": nome_relativo, "status": "erro",
-                    "erro": "Nenhum dado reconhecido neste arquivo.",
-                })
-                _registrar_evento(job, "progresso", {**base_evento, "status": "erro",
-                                                       "detalhe": "nenhum dado reconhecido"})
-                continue
-
-            df["ARQUIVO_ORIGEM"] = os.path.basename(nome_relativo)
-            df["PASTA_ORIGEM"] = os.path.dirname(nome_relativo)
-            dados_por_empresa[empresa].append(df)
-            arquivos_resultado.append({
-                "arquivo_origem": nome_relativo, "status": "ok", "empresa": empresa, "linhas": len(df),
-            })
-            _registrar_evento(job, "progresso", {**base_evento, "status": "ok", "empresa": empresa})
-
-        # Cruzamento SANEAGO + analítica (hidrômetros), mesma lógica do Main.py
-        if dados_por_empresa["SANEAGO"] and dados_por_empresa["SANEAGO_ANALITICA"]:
-            df_saneago = pd.concat(dados_por_empresa["SANEAGO"], ignore_index=True)
-            df_analitica = pd.concat(dados_por_empresa["SANEAGO_ANALITICA"], ignore_index=True)
-            dados_por_empresa["SANEAGO"] = [mesclar_saneago_com_analitica(df_saneago, df_analitica)]
-        dados_por_empresa["SANEAGO_ANALITICA"] = []
-
-        caminho_json = os.path.join(PASTA_BASE, "contas.json")
-        diretorio_saida = pasta_saida()
-        os.makedirs(diretorio_saida, exist_ok=True)
-
-        resumo_empresas = {}
-        for empresa, lista_de_dfs in dados_por_empresa.items():
-            if not lista_de_dfs:
-                continue
-
-            df_novo_lote = pd.concat(lista_de_dfs, ignore_index=True)
-            df_novo_lote, info_enriquecimento = enriquecer_com_contas_json(df_novo_lote, caminho_json)
-            df_novo_lote, descartadas = filtrar_linhas_vazias(df_novo_lote)
-
-            if df_novo_lote.empty:
-                resumo_empresas[empresa] = {
-                    "adicionadas": 0, "duplicadas": 0, "suspeitas": 0,
-                    "descartadas": descartadas, **info_enriquecimento,
-                }
-                continue
-
-            df_novo_lote = marcar_suspeitas(df_novo_lote)
-            caminho_csv = os.path.join(diretorio_saida, f"banco_dados_{empresa.lower()}.csv")
-            resultado = salvar_incremental(df_novo_lote, caminho_csv)
-            resumo_empresas[empresa] = {
-                **resultado,
-                "suspeitas": int(df_novo_lote["SUSPEITO"].sum()),
-                "descartadas": descartadas,
-                **info_enriquecimento,
-            }
-
-        job.resultado = {"arquivos": arquivos_resultado, "empresas": resumo_empresas}
-        job.status = StatusJob.CONCLUIDO
-        _registrar_evento(job, "concluido", job.resultado)
-    except Exception as e:
-        job.status = StatusJob.ERRO
-        job.resultado = {"erro": str(e)}
-        _registrar_evento(job, "erro", {"erro": str(e)})
-    finally:
-        shutil.rmtree(pasta_tmp, ignore_errors=True)
-
-
 @app.get("/pipeline/status-sistema")
 def status_sistema():
-    caminho_json = os.path.join(PASTA_BASE, "contas.json")
+    armazenamento = obter_armazenamento()
+    with sessao() as s:
+        pendentes = s.scalar(select(func.count()).select_from(Job).where(Job.status.in_(("pendente", "processando"))))
     return {
-        "contas_json_encontrado": os.path.exists(caminho_json),
-        "tesseract_resolvido": _comando_resolvido(pytesseract.pytesseract.tesseract_cmd),
+        "contas_json_encontrado": os.path.exists(caminho_contas_json()),
+        # Mesma resolução que o OCR usa (env -> PATH -> instalação padrão no
+        # Windows); o tesseract_cmd do pytesseract só é ajustado quando
+        # ocr_fallback é importado, o que pode ainda não ter acontecido.
+        "tesseract_resolvido": _comando_resolvido(ocr_fallback.localizar_tesseract()),
         "pdftotext_resolvido": _comando_resolvido(PDFTOTEXT_CMD),
         "distribuidoras_implementadas": sorted(EXTRATORES_POR_EMPRESA),
         "distribuidoras_nao_implementadas": sorted(EXTRATORES_NAO_IMPLEMENTADOS),
         "pasta_saida": pasta_saida(),
+        "banco": obter_engine().dialect.name,
+        "armazenamento": armazenamento.tipo,
+        "armazenamento_erro": getattr(app.state, "erro_armazenamento", None),
+        "worker_embutido": worker_embutido(),
+        "jobs_na_fila": int(pendentes or 0),
     }
 
 
+# Maior fatura real hoje: 26 MB. Sem teto, um upload de 300 MB entrava
+# inteiro na memória (medido nos testes de upload).
+UPLOAD_MAX_BYTES = int(float(os.environ.get("UPLOAD_MAX_MB", "100")) * 1024 * 1024)
+
+
+def _ler_com_limite(arquivo: UploadFile) -> bytes:
+    partes, total = [], 0
+    while bloco := arquivo.file.read(1024 * 1024):
+        total += len(bloco)
+        if total > UPLOAD_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{arquivo.filename}: arquivo maior que o limite de {UPLOAD_MAX_BYTES // (1024 * 1024)} MB.",
+            )
+        partes.append(bloco)
+    return b"".join(partes)
+
+
 @app.post("/pipeline/jobs")
-async def criar_job(background_tasks: BackgroundTasks, arquivos: List[UploadFile] = File(...)):
+def criar_job(background_tasks: BackgroundTasks, arquivos: List[UploadFile] = File(...)):
     if not arquivos:
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado.")
 
@@ -390,32 +299,42 @@ async def criar_job(background_tasks: BackgroundTasks, arquivos: List[UploadFile
     if not arquivos_pdf:
         raise HTTPException(status_code=400, detail="Nenhum PDF encontrado no envio.")
 
-    job_id = uuid.uuid4().hex
-    pasta_tmp = tempfile.mkdtemp(prefix=f"pipeline_{job_id}_")
-    arquivos_info = []
-
+    # Blob primeiro (fora da transação; endereçado por conteúdo, idempotente),
+    # depois uma transação curta registrando arquivos/origens/job.
+    armazenamento = obter_armazenamento()
+    recebidos = []
     for arquivo in arquivos_pdf:
-        # nome_relativo é só pra identificação/rótulo — o arquivo em disco usa
-        # nome opaco (uuid), nunca o nome vindo do cliente (ver comentário em /extrair).
-        nome_relativo = arquivo.filename or "arquivo.pdf"
-        caminho_pdf = os.path.join(pasta_tmp, f"{uuid.uuid4().hex}.pdf")
-        conteudo = await arquivo.read()
-        with open(caminho_pdf, "wb") as f:
-            f.write(conteudo)
-        arquivos_info.append((nome_relativo, caminho_pdf))
+        conteudo = _ler_com_limite(arquivo)
+        sha = ingestao.armazenar_blob(conteudo, armazenamento)
+        recebidos.append((sha, len(conteudo), arquivo.filename or "arquivo.pdf"))
 
-    job = Job(id=job_id, total_arquivos=len(arquivos_info))
-    JOBS[job_id] = job
-    background_tasks.add_task(processar_job, job_id, pasta_tmp, arquivos_info)
+    with sessao(escrita=True) as s:
+        itens = []
+        for sha, tamanho, nome in recebidos:
+            arq, origem = ingestao.registrar_arquivo(s, sha, tamanho, nome)
+            itens.append((arq, origem, nome))
+        job = ingestao.criar_job(s, itens)
+        job_id, total = job.id, job.total_arquivos
 
-    return {"job_id": job_id, "total_arquivos": job.total_arquivos}
+    if worker_embutido():
+        import worker
+
+        background_tasks.add_task(worker.executar_job_se_disponivel, job_id)
+
+    return {"job_id": job_id, "total_arquivos": total}
+
+
+def _obter_job(job_id: str) -> Job:
+    with sessao() as s:
+        job = s.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    return job
 
 
 @app.get("/pipeline/jobs/{job_id}")
 def status_job(job_id: str):
-    job = JOBS.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    job = _obter_job(job_id)
     return {
         "job_id": job.id,
         "status": job.status,
@@ -424,99 +343,122 @@ def status_job(job_id: str):
     }
 
 
+def _eventos_desde(job_id: str, ultimo_id: int) -> tuple[list[tuple[int, str, dict]], "str | None"]:
+    with sessao() as s:
+        eventos = [(e.id, e.tipo, e.dados) for e in s.scalars(
+            select(JobEvento).where(JobEvento.job_id == job_id, JobEvento.id > ultimo_id).order_by(JobEvento.id))]
+        status = s.scalar(select(Job.status).where(Job.id == job_id))
+    return eventos, status
+
+
 @app.get("/pipeline/jobs/{job_id}/eventos")
 async def eventos_job(job_id: str):
-    import asyncio
-
-    job = JOBS.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    _obter_job(job_id)
 
     async def streamer():
-        indice = 0
+        ultimo_id = 0
         while True:
-            while indice >= len(job.eventos) and job.status not in (StatusJob.CONCLUIDO, StatusJob.ERRO):
-                await asyncio.sleep(0.4)
-            while indice < len(job.eventos):
-                evento = job.eventos[indice]
-                indice += 1
-                yield f"event: {evento['tipo']}\ndata: {json.dumps(evento['dados'], ensure_ascii=False)}\n\n"
-            if job.status in (StatusJob.CONCLUIDO, StatusJob.ERRO):
-                break
+            eventos, status = await asyncio.to_thread(_eventos_desde, job_id, ultimo_id)
+            for id_evento, tipo, dados in eventos:
+                ultimo_id = id_evento
+                yield f"event: {tipo}\ndata: {json.dumps(dados, ensure_ascii=False)}\n\n"
+                if tipo in ("concluido", "erro"):
+                    return
+            if status in ("concluido", "erro") and not eventos:
+                # Terminal sem evento terminal (não deveria acontecer): fecha
+                # do mesmo jeito que antes, pra UI não ficar pendurada.
+                return
+            await asyncio.sleep(0.4)
 
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 
 @app.get("/pipeline/jobs/{job_id}/csv/{empresa}")
 def baixar_csv(job_id: str, empresa: str):
-    job = JOBS.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job não encontrado.")
-
-    caminho_csv = _caminho_csv_empresa(empresa)
-    if not os.path.exists(caminho_csv):
+    _obter_job(job_id)
+    empresa = _validar_empresa(empresa)
+    with sessao() as s:
+        conteudo = ingestao.exportar_csv_empresa(s, empresa)
+    if conteudo is None:
         raise HTTPException(status_code=404, detail="CSV não encontrado para essa empresa.")
-
-    return FileResponse(caminho_csv, filename=os.path.basename(caminho_csv), media_type="text/csv")
+    return _resposta_csv(conteudo, empresa)
 
 
 # =========================================================
-# DADOS CONSOLIDADOS (aba "Dados" da UI) — navegar os CSVs de
-# dados_saida/ já gravados, por distribuidora, com busca e paginação.
+# DADOS CONSOLIDADOS (aba "Dados" da UI) — faturas ativas do banco, por
+# distribuidora, com busca e paginação no SQL.
 # =========================================================
+
+def _listar_empresas_com_dados(s) -> list[dict]:
+    linhas = {emp: (n, ult) for emp, n, ult in s.execute(
+        select(Fatura.empresa, func.count(), func.max(Fatura.atualizado_em))
+        .where(Fatura.ativa.is_(True)).group_by(Fatura.empresa))}
+    empresas = []
+    for empresa in EMPRESAS_CONHECIDAS:
+        if empresa not in linhas:
+            continue
+        n, ultima = linhas[empresa]
+        if ultima is not None:
+            ultima = ultima.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+        empresas.append({
+            "empresa": empresa,
+            "linhas": int(n),
+            "ultima_modificacao": ultima.isoformat(timespec="seconds") if ultima else None,
+        })
+    return empresas
+
 
 @app.get("/dados/empresas")
 def dados_empresas():
-    return {"empresas": listar_empresas_com_dados(pasta_saida())}
+    with sessao() as s:
+        return {"empresas": _listar_empresas_com_dados(s)}
 
 
 @app.get("/dados/{empresa}")
-def dados_empresa(empresa: str, pagina: int = 1, tamanho_pagina: int = 50, busca: str = ""):
+def dados_empresa(empresa: str, pagina: int = 1, tamanho_pagina: int = 50, busca: str = "",
+                  somente_suspeitas: str = ""):
     empresa = _validar_empresa(empresa)
-    df = carregar_dataframe_empresa(pasta_saida(), empresa)
-    if df is None:
-        raise HTTPException(status_code=404, detail="Nenhum dado encontrado para essa empresa.")
-
     pagina = max(pagina, 1)
     tamanho_pagina = min(max(tamanho_pagina, 1), 500)
 
-    if busca.strip():
-        alvo = busca.strip().lower()
-        colunas_busca = [c for c in ["NOME_CLIENTE", "CONTA_DV", "NUM_FATURA", "ARQUIVO_ORIGEM"] if c in df.columns]
-        mascara = pd.Series(False, index=df.index)
-        for coluna in colunas_busca:
-            mascara = mascara | df[coluna].astype(str).str.lower().str.contains(alvo, na=False, regex=False)
-        df = df[mascara]
+    with sessao() as s:
+        filtros = [Fatura.empresa == empresa, Fatura.ativa.is_(True)]
+        if not s.scalar(select(func.count()).select_from(Fatura).where(*filtros)):
+            raise HTTPException(status_code=404, detail="Nenhum dado encontrado para essa empresa.")
+        if busca.strip():
+            filtros.append(Fatura.texto_busca.contains(busca.strip().lower(), autoescape=True))
+        if _verdadeiro(somente_suspeitas):
+            filtros.append(Fatura.suspeito.is_(True))
 
-    df = df.copy()
-    df["_DATA_ORD"] = pd.to_datetime(df.get("MES_ANO_REF", ""), format="%m/%Y", errors="coerce")
-    df = df.sort_values("_DATA_ORD", ascending=False, na_position="last").drop(columns=["_DATA_ORD"])
-
-    total = len(df)
-    inicio = (pagina - 1) * tamanho_pagina
-    pagina_df = df.iloc[inicio:inicio + tamanho_pagina]
+        total = s.scalar(select(func.count()).select_from(Fatura).where(*filtros))
+        linhas = [d for (d,) in s.execute(
+            select(Fatura.dados).where(*filtros)
+            .order_by(Fatura.competencia.desc().nulls_last(), Fatura.id)
+            .offset((pagina - 1) * tamanho_pagina).limit(tamanho_pagina))]
 
     return {
         "empresa": empresa,
-        "total": total,
+        "total": int(total),
         "pagina": pagina,
         "tamanho_pagina": tamanho_pagina,
-        "linhas": [linha_para_dados(linha) for _, linha in pagina_df.iterrows()],
+        "linhas": linhas,
     }
 
 
 @app.get("/dados/{empresa}/csv")
 def dados_empresa_csv(empresa: str):
-    caminho_csv = _caminho_csv_empresa(empresa)
-    if not os.path.exists(caminho_csv):
+    empresa = _validar_empresa(empresa)
+    with sessao() as s:
+        conteudo = ingestao.exportar_csv_empresa(s, empresa)
+    if conteudo is None:
         raise HTTPException(status_code=404, detail="CSV não encontrado para essa empresa.")
-    return FileResponse(caminho_csv, filename=os.path.basename(caminho_csv), media_type="text/csv")
+    return _resposta_csv(conteudo, empresa)
 
 
 # =========================================================
 # DASHBOARD (aba "Dashboards" da UI) — visão agregada de todas as
 # distribuidoras: KPIs, comparação por empresa, série mensal e maiores
-# consumos/valores. Sem cache — o volume total é pequeno pra pandas.
+# consumos/valores. Mesmo cálculo de antes, com o DataFrame vindo do banco.
 # =========================================================
 
 @app.get("/dashboard/resumo")
@@ -524,10 +466,7 @@ def dashboard_resumo(empresa: "str | None" = None):
     """KPIs e comparação por empresa sempre agregam todas as distribuidoras
     (são gráficos de comparação — não faz sentido filtrar). Já a série
     mensal e os "maiores consumos/valores" respeitam o filtro `empresa`,
-    quando informado (usado pelo seletor "Distribuidora" da aba
-    Dashboards, abaixo dos gráficos de comparação)."""
-    saida = pasta_saida()
-    empresas_info = listar_empresas_com_dados(saida)
+    quando informado."""
     empresa_filtro = _validar_empresa(empresa) if empresa else None
 
     kpis = {"total_faturas": 0, "valor_total": 0.0, "consumo_total": 0.0, "total_suspeitas": 0}
@@ -536,11 +475,18 @@ def dashboard_resumo(empresa: "str | None" = None):
     linhas_top_consumo = []
     linhas_top_valor = []
 
-    for info in empresas_info:
-        empresa = info["empresa"]
-        df = carregar_dataframe_empresa(saida, empresa)
+    with sessao() as s:
+        empresas_info = _listar_empresas_com_dados(s)
+        dataframes = [(info["empresa"], ingestao.dataframe_empresa(s, info["empresa"])) for info in empresas_info]
+
+    for empresa, df in dataframes:
         if df is None or df.empty:
             continue
+        for col in ("VALOR_TOTAL", "CONSUMO_M3"):
+            if col not in df.columns:
+                df[col] = 0.0
+        if "SUSPEITO" not in df.columns:
+            df["SUSPEITO"] = False
 
         valor_total_empresa = float(df["VALOR_TOTAL"].fillna(0).sum())
         consumo_total_empresa = float(df["CONSUMO_M3"].fillna(0).sum())
@@ -558,10 +504,6 @@ def dashboard_resumo(empresa: "str | None" = None):
             "suspeitas": suspeitas_empresa,
         })
 
-        # Série mensal e "maiores consumos/valores" respeitam o filtro por
-        # empresa (se não informado, acumula todas — uma série só no
-        # gráfico final, ver Contexto do plano sobre o teto de séries
-        # categóricas do skill dataviz).
         if empresa_filtro is not None and empresa != empresa_filtro:
             continue
 
@@ -584,22 +526,20 @@ def dashboard_resumo(empresa: "str | None" = None):
                 acumulado["valor_total"] += float(linha["valor_total"] or 0)
                 acumulado["consumo_total"] += float(linha["consumo_total"] or 0)
 
-        if "CONSUMO_M3" in df.columns:
-            for _, linha in df.nlargest(10, "CONSUMO_M3").iterrows():
-                linhas_top_consumo.append({
-                    "empresa": empresa,
-                    "cliente": _texto_ou_vazio(linha.get("NOME_CLIENTE")),
-                    "mes_ano": _texto_ou_vazio(linha.get("MES_ANO_REF")),
-                    "consumo": float(linha.get("CONSUMO_M3") or 0),
-                })
-        if "VALOR_TOTAL" in df.columns:
-            for _, linha in df.nlargest(10, "VALOR_TOTAL").iterrows():
-                linhas_top_valor.append({
-                    "empresa": empresa,
-                    "cliente": _texto_ou_vazio(linha.get("NOME_CLIENTE")),
-                    "mes_ano": _texto_ou_vazio(linha.get("MES_ANO_REF")),
-                    "valor": float(linha.get("VALOR_TOTAL") or 0),
-                })
+        for _, linha in df.nlargest(10, "CONSUMO_M3").iterrows():
+            linhas_top_consumo.append({
+                "empresa": empresa,
+                "cliente": _texto_ou_vazio(linha.get("NOME_CLIENTE")),
+                "mes_ano": _texto_ou_vazio(linha.get("MES_ANO_REF")),
+                "consumo": float(linha.get("CONSUMO_M3") or 0),
+            })
+        for _, linha in df.nlargest(10, "VALOR_TOTAL").iterrows():
+            linhas_top_valor.append({
+                "empresa": empresa,
+                "cliente": _texto_ou_vazio(linha.get("NOME_CLIENTE")),
+                "mes_ano": _texto_ou_vazio(linha.get("MES_ANO_REF")),
+                "valor": float(linha.get("VALOR_TOTAL") or 0),
+            })
 
     por_empresa.sort(key=lambda item: item["valor_total"], reverse=True)
 
@@ -625,10 +565,8 @@ def dashboard_resumo(empresa: "str | None" = None):
 
 
 # =========================================================
-# ERROS REPORTADOS (aba "Erros" da UI) — fila de revisão manual num
-# banco SQLite local (erros_reportados.db, gitignored). Não altera nada
-# em dados_saida/; é só o relato do usuário sobre uma fatura que parece
-# errada, pra alguém revisar depois.
+# ERROS REPORTADOS (aba "Erros" da UI) — fila de revisão manual, agora na
+# tabela erros_reportados do mesmo banco. Não altera fatura nenhuma.
 # =========================================================
 
 class NovoErro(BaseModel):

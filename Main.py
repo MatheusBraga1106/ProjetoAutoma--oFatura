@@ -1,177 +1,154 @@
+"""CLI do extrator: reextração completa e manutenção, sempre sobre o banco
+(DATABASE_URL) e o storage (S3_* ou pasta local em dev). Não grava CSV —
+CSV é exportação gerada do banco (--exportar-csv, ou pela UI/API).
+
+Reextração completa a partir de uma pasta (o que o `python Main.py` antigo
+fazia, agora idempotente e retomável):
+    python Main.py                         # pasta padrão: dados_entrada/
+    python Main.py --pasta /mnt/entrada
+
+A partir de um prefixo do bucket (dentro do container no Dokploy, onde os
+PDFs não estão em disco — copie a pasta pro bucket antes, ex.:
+`mc cp --recursive dados_entrada/ silo/<bucket>/entrada/`):
+    python Main.py --s3-prefixo entrada/
+
+Depois de corrigir um extrator (só os arquivos daquele extrator são
+reextraídos; o resto é pulado):
+    python Main.py --reprocessar-banco [--empresa SANEAGO] [--forcar]
+
+Outros:
+    python Main.py --recalcular            # refaz contas.json/hidrômetro/SUSPEITO sem reextrair
+    python Main.py --exportar-csv PASTA    # banco_dados_<empresa>.csv por distribuidora
+
+Por padrão o job é processado aqui mesmo (com progresso no terminal e
+visível na UI); --enfileirar só cria o job e deixa pro `python worker.py`.
+Interromper (Ctrl+C) é seguro: rodar de novo retoma — o que já entrou fica, e
+arquivo já processado com a mesma versão do extrator é pulado.
+
+Opções de texto: por padrão, na leitura de pasta/prefixo, um .txt útil ao
+lado do PDF (gerado por rodadas antigas do Main.py) é aproveitado como texto
+do PDF — evita refazer ~200 OCRs. --ignorar-txt desliga; --refazer-texto
+ignora também o cache do banco e roda pdftotext/OCR de novo.
+"""
+
+import argparse
 import os
 import sys
 
-import pandas as pd
+for _fluxo in (sys.stdout, sys.stderr):
+    try:
+        _fluxo.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
 
-# Terminal sempre atualizado em tempo real (sem esperar o buffer encher),
-# mesmo quando a saída é redirecionada/capturada por outro processo.
-sys.stdout.reconfigure(line_buffering=True)
-
-from pipeline import (
-    PASTA_BASE,
-    EMPRESAS_CONHECIDAS,
-    EXTRATORES_POR_EMPRESA,
-    EXTRATORES_NAO_IMPLEMENTADOS,
-    identificar_distribuidora,
-    mesclar_saneago_com_analitica,
-    enriquecer_com_contas_json,
-    filtrar_linhas_vazias,
-    marcar_suspeitas,
-    salvar_incremental,
-)
-from extratores.ocr_fallback import eh_texto_ocr, detectar_faturas_sem_texto, gerar_txt_via_ocr
-from extratores.pdftotext_fallback import converter_pdf_para_txt
+from banco.config import PASTA_BASE  # noqa: E402
 
 
-def rastrear_e_processar_pastas(pasta_raiz, pasta_saida):
-    os.makedirs(pasta_saida, exist_ok=True)
+def _imprimir_evento(evento: dict) -> None:
+    status = "ok " if evento.get("status") == "ok" else "ERRO"
+    extra = evento.get("empresa") or ""
+    detalhe = evento.get("detalhe")
+    if detalhe:
+        extra = f"{extra} — {detalhe}" if extra else detalhe
+    print(f" [{evento.get('indice')}/{evento.get('total')}] {status} {evento.get('arquivo')}  {extra}")
 
-    # Gavetas de armazenamento em memória, uma por distribuidora conhecida
-    # (implementada ou não — ver EXTRATORES_NAO_IMPLEMENTADOS em pipeline.py).
-    dados_por_empresa = {empresa: [] for empresa in EMPRESAS_CONHECIDAS}
 
-    print(f"🕷️ A iniciar rastreamento na pasta raiz: '{pasta_raiz}'\n")
+def _executar_ou_enfileirar(job_id: "str | None", enfileirar: bool) -> int:
+    import worker
+    from banco.modelos import Job
+    from banco.sessao import sessao
 
-    # =========================================================
-    # ETAPA 1 - PDFTOTEXT: antes de rotear, tenta extrair o .txt de
-    # qualquer PDF ainda sem texto pareado via pdftotext (rápido, só
-    # funciona em PDFs com camada de texto real).
-    # =========================================================
-    faturas_sem_texto = detectar_faturas_sem_texto(pasta_raiz)
-    if faturas_sem_texto:
-        total_pdftotext = len(faturas_sem_texto)
-        print(f"📄 {total_pdftotext} fatura(s) sem texto extraível — tentando via pdftotext...\n")
-        for i, (caminho_pdf, caminho_txt) in enumerate(faturas_sem_texto, start=1):
-            print(f"   [{i}/{total_pdftotext}] pdftotext: {os.path.basename(caminho_pdf)}")
-            converter_pdf_para_txt(caminho_pdf, caminho_txt)
-        print()
+    if job_id is None:
+        print("Nada a processar.")
+        return 0
+    if enfileirar:
+        print(f"Job {job_id} criado na fila — o worker vai processar.")
+        return 0
+    worker_id = worker.novo_worker_id()
+    if not worker.pegar_proximo_job(worker_id, job_id=job_id):
+        print(f"Job {job_id} já está com outro worker; acompanhe pela UI.")
+        return 0
+    print(f"Processando job {job_id}...")
+    status = worker.executar_job(job_id, worker_id, ao_evento=_imprimir_evento)
+    with sessao() as s:
+        job = s.get(Job, job_id)
+        resultado = job.resultado or {}
+    print("\n" + "=" * 70)
+    print(f"Job {job_id}: {status}")
+    for empresa, info in sorted((resultado.get("empresas") or {}).items()):
+        print(f"  {empresa:16} novas={info['adicionadas']:5} atualizadas={info['atualizadas']:5} "
+              f"duplicadas={info['duplicadas']:5} removidas={info['removidas']:4} "
+              f"suspeitas={info['suspeitas']:4} sem_cadastro={info['linhas_sem_correspondencia']}")
+    erros = [a for a in resultado.get("arquivos", []) if a.get("status") == "erro"]
+    if erros:
+        print(f"  {len(erros)} arquivo(s) com erro (detalhe na UI ou em job_arquivos).")
+    print("=" * 70)
+    return 0 if status == "concluido" else 1
 
-    # =========================================================
-    # ETAPA 2 - FALLBACK OCR: para o que o pdftotext não resolveu
-    # (fatura-imagem, sem camada de texto), gera o .txt via Tesseract.
-    # O .txt sai marcado e cai no walk abaixo como qualquer outro.
-    # =========================================================
-    faturas_sem_texto = detectar_faturas_sem_texto(pasta_raiz)
-    if faturas_sem_texto:
-        total_ocr = len(faturas_sem_texto)
-        print(f"🖨️ {total_ocr} fatura(s) sem texto extraível — gerando via OCR (Tesseract)...\n")
-        for i, (caminho_pdf, caminho_txt) in enumerate(faturas_sem_texto, start=1):
-            print(f"   [{i}/{total_ocr}] OCR: {os.path.basename(caminho_pdf)}")
-            try:
-                gerar_txt_via_ocr(caminho_pdf, caminho_txt)
-            except Exception as e:
-                print(f"   ⚠️ Falhou o OCR deste arquivo, seguindo para o próximo: {e}")
-        print()
 
-    total_txt = sum(
-        1 for _raiz, _subpastas, arquivos in os.walk(pasta_raiz)
-        for f in arquivos if f.lower().endswith('.txt')
-    )
-    arquivos_processados = 0
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Reextração/manutenção das faturas no banco.")
+    origem = parser.add_mutually_exclusive_group()
+    origem.add_argument("--pasta", help="pasta com os PDFs (default: dados_entrada/)")
+    origem.add_argument("--s3-prefixo", help="prefixo do bucket com os PDFs (ex.: entrada/)")
+    origem.add_argument("--reprocessar-banco", action="store_true",
+                        help="reprocessa os arquivos que já estão no banco")
+    origem.add_argument("--recalcular", action="store_true",
+                        help="só recalcula derivados (contas.json, hidrômetro, SUSPEITO)")
+    origem.add_argument("--exportar-csv", metavar="PASTA", help="exporta um CSV por distribuidora")
+    parser.add_argument("pasta_posicional", nargs="?", help=argparse.SUPPRESS)
+    parser.add_argument("--empresa", help="com --reprocessar-banco: só esta distribuidora")
+    parser.add_argument("--forcar", action="store_true", help="reextrai mesmo sem mudança de versão")
+    parser.add_argument("--refazer-texto", action="store_true", help="refaz pdftotext/OCR (ignora cache e .txt)")
+    parser.add_argument("--ignorar-txt", action="store_true", help="não aproveita .txt ao lado dos PDFs")
+    parser.add_argument("--enfileirar", action="store_true", help="só cria o job (o worker processa)")
+    args = parser.parse_args(argv)
 
-    for diretorio_atual, subpastas, arquivos in os.walk(pasta_raiz):
-        arquivos_txt = [f for f in arquivos if f.lower().endswith('.txt')]
+    import ingestao
+    from banco.sessao import obter_engine, sessao
 
-        for arquivo in arquivos_txt:
-            arquivos_processados += 1
-            # Cria o caminho absoluto (C:\...)
-            caminho_completo = os.path.abspath(os.path.join(diretorio_atual, arquivo))
+    obter_engine()  # cria/atualiza schema (idempotente)
+    parametros = {"forcar": args.forcar, "refazer_texto": args.refazer_texto}
+    usar_txt = not (args.ignorar_txt or args.refazer_texto)
 
-            # 🛡️ TRUQUE ANTI-LIMITE DO WINDOWS (MAX_PATH > 260 caracteres)
-            if os.name == 'nt' and not caminho_completo.startswith('\\\\?\\'):
-                caminho_completo = '\\\\?\\' + caminho_completo
+    if args.recalcular:
+        with sessao(escrita=True) as s:
+            n = ingestao.recalcular_desatualizados(s, todos=True)
+        print(f"Derivados recalculados em {n} fatura(s).")
+        return 0
 
-            print(f" [{arquivos_processados}/{total_txt}] Lendo: {arquivo} (Pasta: {os.path.basename(diretorio_atual)})")
+    if args.exportar_csv:
+        from pipeline import EMPRESAS_CONHECIDAS
 
-            # =========================================================
-            # ROTEADOR (tabela compartilhada com a API, em pipeline.py)
-            # =========================================================
-            empresa_identificada = identificar_distribuidora(f"{arquivo} {diretorio_atual}")
+        os.makedirs(args.exportar_csv, exist_ok=True)
+        with sessao() as s:
+            for empresa in EMPRESAS_CONHECIDAS:
+                conteudo = ingestao.exportar_csv_empresa(s, empresa)
+                if conteudo is None:
+                    continue
+                destino = os.path.join(args.exportar_csv, f"banco_dados_{empresa.lower()}.csv")
+                with open(destino, "wb") as f:
+                    f.write(conteudo)
+                print(f"  {destino}")
+        return 0
 
-            if empresa_identificada is None:
-                print(" ⏭ Ignorado: Não foi possível identificar a empresa.")
-                continue
+    if args.reprocessar_banco:
+        empresa = args.empresa.upper() if args.empresa else None
+        return _executar_ou_enfileirar(ingestao.job_reprocessar_banco(empresa, parametros), args.enfileirar)
 
-            if empresa_identificada in EXTRATORES_NAO_IMPLEMENTADOS:
-                print(f" ⏭ Extrator {empresa_identificada} ainda não criado. A saltar...")
-                continue
+    if args.s3_prefixo:
+        print(f"Lendo PDFs do storage em '{args.s3_prefixo}'...")
+        job_id = ingestao.job_de_prefixo_storage(args.s3_prefixo, usar_txt, parametros, progresso=print)
+        return _executar_ou_enfileirar(job_id, args.enfileirar)
 
-            is_ocr = eh_texto_ocr(caminho_completo)
-            df_extraido = EXTRATORES_POR_EMPRESA[empresa_identificada](caminho_completo, is_ocr)
-
-            # =========================================================
-            # GUARDA O RESULTADO NA GAVETA CORRETA
-            # =========================================================
-            if df_extraido is not None and not df_extraido.empty:
-                df_extraido['ARQUIVO_ORIGEM'] = arquivo
-                df_extraido['PASTA_ORIGEM'] = diretorio_atual
-                dados_por_empresa[empresa_identificada].append(df_extraido)
-
-    # =========================================================
-    # RELACIONAMENTO 1: SANEAGO NORMAL + SANEAGO ANALÍTICA (HIDRÔMETROS)
-    # =========================================================
-    if len(dados_por_empresa["SANEAGO"]) > 0 and len(dados_por_empresa["SANEAGO_ANALITICA"]) > 0:
-        print("\n🔗 Relacionando faturas da SANEAGO com hidrômetros analíticos...")
-        df_saneago = pd.concat(dados_por_empresa["SANEAGO"], ignore_index=True)
-        df_analitica = pd.concat(dados_por_empresa["SANEAGO_ANALITICA"], ignore_index=True)
-        dados_por_empresa["SANEAGO"] = [mesclar_saneago_com_analitica(df_saneago, df_analitica)]
-        dados_por_empresa["SANEAGO_ANALITICA"] = []
-
-    # =========================================================
-    # EXPORTAÇÃO INCREMENTAL E ENRIQUECIMENTO VIA JSON
-    # =========================================================
-    print("\n" + "="*70)
-    print("🛡️ A SALVAR NA BASE DE DADOS E ENRIQUECER COM JSON")
-    print("="*70)
-
-    caminho_json = os.path.join(PASTA_BASE, "contas.json")
-
-    for empresa, lista_de_dfs in dados_por_empresa.items():
-        if len(lista_de_dfs) == 0 or empresa == "SANEAGO_ANALITICA":
-            continue
-
-        df_novo_lote = pd.concat(lista_de_dfs, ignore_index=True)
-
-        df_novo_lote, info_enriquecimento = enriquecer_com_contas_json(df_novo_lote, caminho_json)
-        if not info_enriquecimento["contas_json_encontrado"]:
-            print(f" ⚠️ {empresa}: contas.json não encontrado — seguindo sem enriquecimento "
-                  f"(UNIDADE JUDICIÁRIA/ENDEREÇO ficam em branco).")
-        elif info_enriquecimento["linhas_sem_correspondencia"] > 0:
-            print(f" ⚠️ {empresa}: {info_enriquecimento['linhas_sem_correspondencia']} "
-                  f"fatura(s) sem conta correspondente no contas.json.")
-
-        df_novo_lote, descartadas = filtrar_linhas_vazias(df_novo_lote)
-        if descartadas:
-            print(f" 🗑️ {empresa}: {descartadas} linha(s) vazia(s)/residual(is) descartada(s).")
-
-        if df_novo_lote.empty:
-            continue
-
-        df_novo_lote = marcar_suspeitas(df_novo_lote)
-        qtd_suspeitas = int(df_novo_lote['SUSPEITO'].sum())
-        if qtd_suspeitas:
-            print(f" 🔍 {empresa}: {qtd_suspeitas} fatura(s) marcada(s) como SUSPEITO "
-                  f"(valores não batem) — revisar.")
-
-        # =========================================================
-        # LÓGICA ANTI-DUPLICATA E SALVAMENTO CSV
-        # =========================================================
-        caminho_csv = os.path.join(pasta_saida, f"banco_dados_{empresa.lower()}.csv")
-        resultado = salvar_incremental(df_novo_lote, caminho_csv)
-
-        if resultado["arquivo_novo"]:
-            print(f"✨ {empresa}: {resultado['adicionadas']} faturas gravadas. (Novo ficheiro criado)")
-        elif resultado["adicionadas"] > 0:
-            print(f"➕ {empresa}: {resultado['adicionadas']} faturas ADICIONADAS. "
-                  f"(Ignoradas {resultado['duplicadas']} duplicatas)")
-        else:
-            print(f"⏩ {empresa}: Nenhuma fatura nova. (Ignoradas {resultado['duplicadas']} faturas)")
-
-    print("="*70 + "\n")
+    pasta = args.pasta or args.pasta_posicional or os.path.join(PASTA_BASE, "dados_entrada")
+    if not os.path.isdir(pasta):
+        print(f"Pasta não encontrada: {pasta}")
+        return 2
+    print(f"Lendo PDFs de '{pasta}'...")
+    job_id = ingestao.job_de_pasta(pasta, usar_txt, parametros, progresso=print)
+    return _executar_ou_enfileirar(job_id, args.enfileirar)
 
 
 if __name__ == "__main__":
-    PASTA_RAIZ_DADOS = os.path.join(PASTA_BASE, "dados_entrada")
-    PASTA_SAIDA = os.path.join(PASTA_BASE, "dados_saida")
-
-    rastrear_e_processar_pastas(PASTA_RAIZ_DADOS, PASTA_SAIDA)
+    sys.exit(main())

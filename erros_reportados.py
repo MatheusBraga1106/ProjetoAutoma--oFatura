@@ -1,77 +1,92 @@
-"""Banco de erros reportados pela aba "Erros" da UI — SQLite simples, sem
-dependência nova (sqlite3 é builtin), seguindo o mesmo padrão do hub-faturas
-(banco de arquivo local, sem precisar de Docker/Postgres pra rodar). Guarda
-só o relato do usuário (o que ele acha que está errado numa fatura já
-extraída) + a referência da fatura, se ele souber; não altera nada nos CSVs
-de dados_saida/ — é puramente uma fila de revisão manual."""
+"""Fila de erros reportados pela aba "Erros" da UI — agora no mesmo banco das
+faturas (tabela erros_reportados; ver banco/modelos.py). Guarda o relato do
+usuário + a referência da fatura; quando a referência bate com a chave de
+uma fatura do banco, liga as duas (fatura_id). Não altera nenhuma fatura —
+é só uma fila de revisão manual.
 
-import os
-import sqlite3
+As funções mantêm a assinatura e o formato de saída da versão SQLite antiga
+(dicts com id, concessionaria, num_fatura, conta_dv, mes_ano_ref, mensagem,
+status, data_criacao). Pra trazer os relatos do erros_reportados.db antigo:
+    python -m banco.migrar --importar-erros-sqlite erros_reportados.db
+"""
+
 from datetime import datetime
 
-PASTA_BASE = os.path.dirname(os.path.abspath(__file__))
-CAMINHO_DB = os.environ.get("ERROS_DB_PATH", os.path.join(PASTA_BASE, "erros_reportados.db"))
+from sqlalchemy import select
+
+from banco.modelos import ErroReportado, Fatura
+from banco.sessao import obter_engine, sessao
 
 STATUS_VALIDOS = {"aberto", "resolvido"}
 
 
-def _conectar() -> sqlite3.Connection:
-    conn = sqlite3.connect(CAMINHO_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def inicializar_db() -> None:
-    with _conectar() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS erros_reportados (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                concessionaria TEXT,
-                num_fatura TEXT,
-                conta_dv TEXT,
-                mes_ano_ref TEXT,
-                mensagem TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'aberto',
-                data_criacao TEXT NOT NULL
-            )
-        """)
+    """Compatibilidade: o schema é criado por banco.migrar (automaticamente
+    no primeiro uso do banco)."""
+    obter_engine()
+
+
+def _para_dict(erro: ErroReportado) -> dict:
+    return {
+        "id": erro.id,
+        "concessionaria": erro.concessionaria,
+        "num_fatura": erro.num_fatura,
+        "conta_dv": erro.conta_dv,
+        "mes_ano_ref": erro.mes_ano_ref,
+        "mensagem": erro.mensagem,
+        "status": erro.status,
+        "data_criacao": erro.data_criacao,
+        "fatura_id": erro.fatura_id,
+    }
+
+
+def _achar_fatura(s, concessionaria: str, num_fatura: str, conta_dv: str, mes_ano_ref: str) -> "int | None":
+    if not concessionaria:
+        return None
+    from ingestao import chave_eh_completa, normalizar_mes_ano, normalizar_num_fatura
+    from pipeline import normalizar_conta_dv
+
+    empresa = concessionaria.strip().upper()
+    nf, mes, conta = normalizar_num_fatura(num_fatura), normalizar_mes_ano(mes_ano_ref), normalizar_conta_dv(conta_dv)
+    if not chave_eh_completa(empresa, nf, mes, conta):
+        return None
+    return s.scalar(select(Fatura.id).where(Fatura.chave_natural == f"{empresa}|{nf}|{mes}|{conta}"))
 
 
 def criar_erro(mensagem: str, concessionaria: str = "", num_fatura: str = "",
                conta_dv: str = "", mes_ano_ref: str = "") -> dict:
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _conectar() as conn:
-        cursor = conn.execute(
-            """INSERT INTO erros_reportados
-               (concessionaria, num_fatura, conta_dv, mes_ano_ref, mensagem, status, data_criacao)
-               VALUES (?, ?, ?, ?, ?, 'aberto', ?)""",
-            (concessionaria.strip(), num_fatura.strip(), conta_dv.strip(), mes_ano_ref.strip(),
-             mensagem.strip(), agora),
+    with sessao(escrita=True) as s:
+        erro = ErroReportado(
+            concessionaria=concessionaria.strip(), num_fatura=num_fatura.strip(), conta_dv=conta_dv.strip(),
+            mes_ano_ref=mes_ano_ref.strip(), mensagem=mensagem.strip(), status="aberto",
+            data_criacao=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
-        novo_id = cursor.lastrowid
-    return obter_erro(novo_id)
+        erro.fatura_id = _achar_fatura(s, erro.concessionaria, erro.num_fatura, erro.conta_dv, erro.mes_ano_ref)
+        s.add(erro)
+        s.flush()
+        return _para_dict(erro)
 
 
 def obter_erro(erro_id: int) -> "dict | None":
-    with _conectar() as conn:
-        linha = conn.execute("SELECT * FROM erros_reportados WHERE id = ?", (erro_id,)).fetchone()
-    return dict(linha) if linha else None
+    with sessao() as s:
+        erro = s.get(ErroReportado, erro_id)
+        return _para_dict(erro) if erro else None
 
 
 def listar_erros(status: "str | None" = None) -> list[dict]:
-    with _conectar() as conn:
+    with sessao() as s:
+        consulta = select(ErroReportado).order_by(ErroReportado.id.desc())
         if status:
-            linhas = conn.execute(
-                "SELECT * FROM erros_reportados WHERE status = ? ORDER BY id DESC", (status,)
-            ).fetchall()
-        else:
-            linhas = conn.execute("SELECT * FROM erros_reportados ORDER BY id DESC").fetchall()
-    return [dict(linha) for linha in linhas]
+            consulta = consulta.where(ErroReportado.status == status)
+        return [_para_dict(e) for e in s.scalars(consulta)]
 
 
 def atualizar_status(erro_id: int, status: str) -> "dict | None":
     if status not in STATUS_VALIDOS:
         raise ValueError(f"status inválido: {status!r} (esperado um de {STATUS_VALIDOS})")
-    with _conectar() as conn:
-        conn.execute("UPDATE erros_reportados SET status = ? WHERE id = ?", (status, erro_id))
-    return obter_erro(erro_id)
+    with sessao(escrita=True) as s:
+        erro = s.get(ErroReportado, erro_id)
+        if erro is None:
+            return None
+        erro.status = status
+        return _para_dict(erro)

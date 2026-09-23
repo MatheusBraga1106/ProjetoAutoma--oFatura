@@ -1,10 +1,13 @@
 """Lógica de pipeline compartilhada entre o modo CLI (Main.py, varredura de
-pastas) e a API/UI (api.py, upload avulso ou em lote). Mantém num único
-lugar o roteamento por distribuidora, o cruzamento SANEAGO+analítica, o
-enriquecimento via contas.json e a gravação incremental anti-duplicata —
-pra CLI e UI nunca divergirem no que já foi corrigido aqui (ver
-CONTA_DV normalizado e colunas sempre completas no CSV)."""
+pastas), a API/UI (api.py) e o worker (worker.py, via ingestao.py). Mantém
+num único lugar o roteamento por distribuidora, o cruzamento
+SANEAGO+analítica, o enriquecimento via contas.json, a marcação de
+suspeitas e a versão de código de cada extrator — pra nenhum ponto de
+entrada divergir no que já foi corrigido aqui (ver CONTA_DV normalizado).
+A gravação em si (banco + storage, dedup, versões) fica em ingestao.py."""
 
+import functools
+import hashlib
 import json
 import os
 import re
@@ -13,7 +16,8 @@ from datetime import datetime
 
 import pandas as pd
 
-from extratores.saneago import extrair_saneago
+from banco.config import caminho_contas_json
+from extratores.saneago import carregar_flags_contas, carregar_mapa_contas, extrair_saneago
 from extratores.saneago_analitica import extrair_saneago_analitica
 from extratores.sae import extrair_sae
 from extratores.codego import extrair_codego
@@ -46,9 +50,25 @@ PADROES_DISTRIBUIDORA = [
     (("chesp",), "CHESP"),
 ]
 
+def _extrair_saneago_com_contas(caminho, is_ocr):
+    """Chama extrair_saneago passando o cadastro de contas lido de
+    CONTAS_JSON_PATH — sem isso o extrator cai no default "contas.json"
+    relativo ao cwd (que no container/worker não é a raiz do projeto). Só o
+    caminho OCR usa esses mapas; a lógica de extração não muda."""
+    if not is_ocr:
+        return extrair_saneago(caminho, is_ocr=False)
+    caminho_json = caminho_contas_json()
+    return extrair_saneago(
+        caminho,
+        is_ocr=True,
+        contas_conhecidas=carregar_mapa_contas(caminho_json),
+        flags_contas=carregar_flags_contas(caminho_json),
+    )
+
+
 EXTRATORES_POR_EMPRESA = {
     "SANEAGO_ANALITICA": lambda caminho, is_ocr: extrair_saneago_analitica(caminho),
-    "SANEAGO": lambda caminho, is_ocr: extrair_saneago(caminho, is_ocr=is_ocr),
+    "SANEAGO": _extrair_saneago_com_contas,
     "CODEGO": lambda caminho, is_ocr: extrair_codego(caminho),
     "IPAMERI": lambda caminho, is_ocr: extrair_aguas_ipameri(caminho),
     "BURITI_ALEGRE": lambda caminho, is_ocr: extrair_buriti_alegre(caminho),
@@ -62,6 +82,86 @@ EXTRATORES_POR_EMPRESA = {
 EXTRATORES_NAO_IMPLEMENTADOS = {"SANESC", "CHESP"}
 
 EMPRESAS_CONHECIDAS = list(EXTRATORES_POR_EMPRESA) + sorted(EXTRATORES_NAO_IMPLEMENTADOS)
+
+# Módulo-fonte de cada extrator — é o conteúdo desse arquivo que define a
+# "versão do extrator" gravada em cada fatura (ver versao_extrator).
+MODULO_POR_EMPRESA = {
+    "SANEAGO_ANALITICA": "saneago_analitica",
+    "SANEAGO": "saneago",
+    "CODEGO": "codego",
+    "IPAMERI": "aguas_ipameri",
+    "BURITI_ALEGRE": "buriti_alegre",
+    "DEMAE": "demae",
+    "SAAE_ABADIANIA": "saae_abadiania",
+    "SAAE_CORUMBA": "saae_corumba",
+    "SAAE_MINEIROS": "saae_mineiros",
+    "SAE": "sae",
+}
+
+# Suba este número quando mudar uma regra GENÉRICA que altera o resultado da
+# extração de todas as distribuidoras (filtrar_linhas_vazias, normalização
+# da chave da fatura em ingestao.py...). Mudança dentro de um extrator não
+# precisa: o hash do arquivo do extrator já muda sozinho.
+VERSAO_REGRAS_EXTRACAO = "1"
+
+
+@functools.lru_cache(maxsize=64)
+def _sha_arquivo(caminho: str, _mtime: float, _tamanho: int) -> str:
+    with open(caminho, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _sha_de(caminho: str) -> str:
+    try:
+        st = os.stat(caminho)
+    except OSError:
+        return "ausente"
+    return _sha_arquivo(caminho, st.st_mtime, st.st_size)
+
+
+def _sha_contas_para_saneago(caminho_json: str) -> str:
+    """Hash só das colunas do contas.json que o extrator SANEAGO usa (no
+    caminho OCR: CONTA/CONTA_DV e flags) — editar endereço ou unidade não
+    deve forçar reextração."""
+    if not os.path.exists(caminho_json):
+        return "sem-contas"
+    st = os.stat(caminho_json)
+    return _sha_contas_cache(caminho_json, st.st_mtime, st.st_size)
+
+
+@functools.lru_cache(maxsize=8)
+def _sha_contas_cache(caminho_json: str, _mtime: float, _tamanho: int) -> str:
+    with open(caminho_json, encoding="utf-8") as f:
+        registros = json.load(f)
+    projecao = sorted(
+        (str(r.get("CONTA", "")), str(r.get("CONTA_DV", "")), bool(r.get("AGUA", False)),
+         bool(r.get("ESGOTO", False)), bool(r.get("SMRSU", False)))
+        for r in registros
+    )
+    return hashlib.sha256(json.dumps(projecao).encode()).hexdigest()
+
+
+def versao_extrator(empresa: str) -> str:
+    """Identificador da versão do código que extrai `empresa`: hash do
+    arquivo-fonte do extrator + VERSAO_REGRAS_EXTRACAO. Muda sozinho a cada
+    correção num extrator (não depende de git, que não vai pra imagem
+    Docker). Pra SANEAGO inclui também o hash do trecho do contas.json que o
+    extrator consulta no caminho OCR, já que o resultado depende dele."""
+    modulo = MODULO_POR_EMPRESA[empresa]
+    caminho = os.path.join(PASTA_BASE, "extratores", f"{modulo}.py")
+    base = hashlib.sha256(f"{_sha_de(caminho)}|{VERSAO_REGRAS_EXTRACAO}".encode()).hexdigest()[:12]
+    versao = f"{modulo}:{base}"
+    if empresa == "SANEAGO":
+        versao += "+contas:" + _sha_contas_para_saneago(caminho_contas_json())[:8]
+    return versao
+
+
+def versao_texto() -> str:
+    """Versão da camada de texto (pdftotext + OCR) — gravada junto do texto
+    em cache, pra saber quais textos vieram de um código de OCR antigo."""
+    pasta = os.path.join(PASTA_BASE, "extratores")
+    partes = [_sha_de(os.path.join(pasta, n)) for n in ("pdftotext_fallback.py", "ocr_fallback.py")]
+    return hashlib.sha256("|".join(partes).encode()).hexdigest()[:12]
 
 
 def normalizar_texto(texto: str) -> str:
@@ -254,7 +354,10 @@ def marcar_suspeitas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# GRAVAÇÃO INCREMENTAL ANTI-DUPLICATA
+# GRAVAÇÃO INCREMENTAL ANTI-DUPLICATA — LEGADO (CSV)
+# A persistência oficial agora é o banco (ingestao.py). salvar_incremental
+# e as leituras de CSV abaixo ficam só pra comparar/importar a saída antiga
+# em dados_saida/; nenhum ponto de entrada (Main/api/worker) grava CSV mais.
 # =========================================================
 
 DTYPES_CSV = {"NUM_FATURA": str, "MES_ANO_REF": str, "CONTA_DV": str}

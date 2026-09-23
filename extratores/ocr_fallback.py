@@ -1,5 +1,4 @@
 import os
-import io
 import glob
 import shutil
 
@@ -7,18 +6,21 @@ import pymupdf
 import pytesseract
 from PIL import Image
 
-# As faturas vêm de pastas locais controladas pelo próprio usuário (não são
-# uploads de terceiros), então desativamos a trava de "decompression bomb"
-# do Pillow: em 400 DPI, páginas maiores que A4 passam do limite padrão
-# (~179M pixels) e derrubam o OCR sem motivo real de segurança aqui.
-Image.MAX_IMAGE_PIXELS = None
-
 # Marcador gravado na primeira linha de qualquer .txt gerado por este
 # módulo. É assim que o roteador do Main.py sabe que aquele texto veio de
 # OCR (não do pdftotext) e precisa avisar o extrator disso.
 MARCADOR_OCR = "#### TEXTO_GERADO_VIA_OCR ####"
 
 DPI_PADRAO = 400
+
+# Teto de pixels por página rasterizada. Os PDFs chegam por upload web, e um
+# PDF de poucos bytes pode declarar uma página enorme (teste: 520 bytes ->
+# ~868 MB de RAM). Acima do teto a página é rasterizada com DPI menor em vez
+# de recusada: há fatura real assim (DEMAE Panamá, 284 Mpx a 400 DPI), e numa
+# página fisicamente gigante as letras também são, então lê bem com menos DPI.
+# A4 a 400 DPI = 15,5 Mpx, bem abaixo do teto — faturas normais não mudam.
+LIMITE_PIXELS_PAGINA = int(os.environ.get("OCR_LIMITE_PIXELS_PAGINA", 40_000_000))
+Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS or 0, int(LIMITE_PIXELS_PAGINA * 1.1))
 PSM_PADRAO = 4  # "assume uma única coluna de texto de tamanhos variados"
 IDIOMA_PADRAO = "por"
 
@@ -125,19 +127,31 @@ def detectar_faturas_sem_texto(pasta_raiz, min_chars=50):
     return faltantes
 
 
+def matriz_rasterizacao(pagina, dpi=DPI_PADRAO):
+    """Zoom de `dpi`, reduzido só o necessário pra página caber em
+    LIMITE_PIXELS_PAGINA."""
+    zoom = dpi / 72
+    pixels = (pagina.rect.width * zoom) * (pagina.rect.height * zoom)
+    if pixels > LIMITE_PIXELS_PAGINA:
+        zoom *= (LIMITE_PIXELS_PAGINA / pixels) ** 0.5
+    return pymupdf.Matrix(zoom, zoom)
+
+
 def ocr_pdf(caminho_pdf, dpi=DPI_PADRAO, psm=PSM_PADRAO, lang=IDIOMA_PADRAO, callback_pagina=None):
     """Rasteriza cada página do PDF (via PyMuPDF, sem depender do poppler)
     e roda o Tesseract em cima da imagem. Retorna o texto de todas as
     páginas concatenado com quebra de linha entre elas."""
     doc = pymupdf.open(caminho_longo(caminho_pdf))
-    zoom = dpi / 72
-    mat = pymupdf.Matrix(zoom, zoom)
     config = f"--psm {psm}"
 
     paginas_texto = []
     for i, pagina in enumerate(doc):
-        pix = pagina.get_pixmap(matrix=mat)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        pix = pagina.get_pixmap(matrix=matriz_rasterizacao(pagina, dpi))
+        # Direto dos bytes do pixmap (sem ida e volta por PNG): mesma imagem,
+        # sem a cópia comprimida extra na memória.
+        modo = "RGB" if pix.n == 3 else "L" if pix.n == 1 else "RGBA"
+        img = Image.frombytes(modo, (pix.width, pix.height), pix.samples)
+        del pix
         texto = pytesseract.image_to_string(img, lang=lang, config=config)
         paginas_texto.append(texto)
         if callback_pagina:
