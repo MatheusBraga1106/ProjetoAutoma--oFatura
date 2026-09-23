@@ -146,21 +146,33 @@ docker exec <app>-faturas-db-1 psql -U faturas -d faturas -c '\dt'
 docker exec <app>-faturas-storage-1 sh -c \
   'mcli alias set app http://127.0.0.1:9000 faturas-app "<S3_SECRET_KEY>" >/dev/null && mcli ls app/faturas-agua'
 
-# Nada publicado no host (a coluna PORTS deve mostrar só portas internas, sem 0.0.0.0:)
+# Portas no host: só estas duas, e nada mais com 0.0.0.0:
+#   faturas-app  0.0.0.0:8090->8000/tcp       (UI, com senha)
+#   faturas-db   127.0.0.1:5433->5432/tcp     (só local, pro DBeaver via túnel)
 docker ps --filter "label=com.docker.compose.project=<app>" --format "{{.Names}} {{.Ports}}"
 ```
 
-**Console web do storage (opcional).** Ele não tem porta no host de propósito. Quando precisar, suba um túnel temporário e acesse por SSH:
+**Console web do storage (opcional).** Ele não tem porta no host de propósito. Quando precisar, suba um túnel temporário e acesse por SSH. O container auxiliar nasce na rede padrão (é nela que a porta é publicada — numa rede `internal` o Docker não publica porta) e depois é ligado à rede interna do projeto:
 
 ```bash
 # na VPS
-docker run --rm -d --name console-tunel --network <app>_interno -p 127.0.0.1:9001:9001 \
+docker run --rm -d --name console-tunel -p 127.0.0.1:9001:9001 \
   alpine/socat tcp-listen:9001,fork,reuseaddr tcp-connect:faturas-storage:9001
+docker network connect <app>_interno console-tunel
 # na sua máquina
 ssh -L 9001:127.0.0.1:9001 root@<ip-da-vps>     # abrir http://localhost:9001 (login = STORAGE_ROOT_*)
 # ao terminar, na VPS
 docker stop console-tunel
 ```
+
+**Ver o banco no DBeaver (só leitura).** O `faturas-migrar` cria o usuário `DB_USUARIO_LEITURA` (`leitura`) com permissão só de consulta, e o Postgres fica publicado em `127.0.0.1:5433` **da VPS** — de fora ninguém alcança; o DBeaver entra por túnel SSH, que ele mesmo abre:
+
+1. DBeaver → **Nova conexão → PostgreSQL**.
+2. Aba **Main**: Host `localhost`, Port `5433`, Database `faturas`, Username `leitura`, Password = `DB_SENHA_LEITURA` (do arquivo de segredos). "localhost" aqui é a VPS, visto de dentro do túnel.
+3. Aba **SSH**: marque **Use SSH Tunnel**. Host = IP da VPS, Port `22`, usuário e senha (ou chave) que você já usa pra entrar na VPS.
+4. **Test Connection** → **Finish**. As tabelas ficam em `faturas → Schemas → public → Tables`; a principal é `faturas` (uma linha por fatura, com os campos específicos de cada distribuidora na coluna `dados`).
+
+Qualquer tentativa de alterar dado por esse usuário falha (`read-only transaction` ou `permission denied`) — é o esperado. Pra alterar algo de propósito, use a própria app (reprocessar/reextrair), não o banco na mão.
 
 ## 8. Backups (fazer no mesmo dia do primeiro deploy)
 

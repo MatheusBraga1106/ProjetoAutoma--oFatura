@@ -16,6 +16,7 @@ Alembic (mesmo padrão do hub-faturas).
 
 import argparse
 import os
+import re
 import sqlite3
 import sys
 
@@ -52,6 +53,42 @@ def migrar(engine: Engine) -> None:
             conexao.execute(
                 Meta.__table__.update().where(Meta.chave == "versao_schema").values(valor=VERSAO_SCHEMA)
             )
+
+
+_NOME_USUARIO_PG = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_SENHA_SEGURA = re.compile(r"^[A-Za-z0-9]{16,}$")
+
+
+def validar_usuario_leitura(usuario: str, senha: str) -> None:
+    """Nome e senha entram direto no DDL (CREATE ROLE não aceita parâmetro),
+    então só aceita formato que não precisa de escape nenhum."""
+    if not _NOME_USUARIO_PG.match(usuario):
+        raise ValueError(f"DB_USUARIO_LEITURA inválido: {usuario!r} (use minúsculas, dígitos e _)")
+    if not _SENHA_SEGURA.match(senha):
+        raise ValueError("DB_SENHA_LEITURA precisa ter 16+ caracteres só com letras e dígitos")
+
+
+def garantir_usuario_leitura(engine: Engine, usuario: str, senha: str) -> bool:
+    """Cria (ou atualiza a senha de) um usuário Postgres SÓ DE LEITURA, pra
+    olhar o banco num cliente visual (DBeaver) sem risco de alterar dado.
+    Idempotente. Devolve False fora do Postgres (SQLite de dev: não se aplica)."""
+    if engine.dialect.name != "postgresql":
+        return False
+    validar_usuario_leitura(usuario, senha)
+    if usuario == engine.url.username:
+        # ALTER ROLE ... NOSUPERUSER no usuário da própria app derrubaria a app.
+        raise ValueError("DB_USUARIO_LEITURA não pode ser o mesmo usuário da app (POSTGRES_USER)")
+    with engine.begin() as conexao:
+        conexao.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _CHAVE_LOCK_PG})
+        existe = conexao.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :u"), {"u": usuario}).first()
+        acao = "ALTER" if existe else "CREATE"
+        conexao.execute(text(f"{acao} ROLE {usuario} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                             f"PASSWORD '{senha}'"))
+        # pg_read_all_data (Postgres 14+): SELECT em tudo, inclusive tabelas
+        # criadas depois. Transação só-leitura por padrão, por garantia.
+        conexao.execute(text(f"GRANT pg_read_all_data TO {usuario}"))
+        conexao.execute(text(f"ALTER ROLE {usuario} SET default_transaction_read_only = on"))
+    return True
 
 
 def importar_erros_sqlite(caminho_db_antigo: str) -> int:
@@ -108,6 +145,11 @@ def main(argv=None) -> int:
     migrar(engine)  # explícito mesmo com MIGRAR_NA_INICIALIZACAO=0
     url = engine.url.render_as_string(hide_password=True)
     print(f"Schema OK (versão {VERSAO_SCHEMA}) em {url}")
+
+    usuario_leitura = os.environ.get("DB_USUARIO_LEITURA", "").strip()
+    senha_leitura = os.environ.get("DB_SENHA_LEITURA", "").strip()
+    if usuario_leitura and senha_leitura and garantir_usuario_leitura(engine, usuario_leitura, senha_leitura):
+        print(f"Usuário só de leitura '{usuario_leitura}' pronto (pra DBeaver via túnel SSH)")
 
     if args.importar_erros_sqlite:
         n = importar_erros_sqlite(args.importar_erros_sqlite)

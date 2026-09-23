@@ -45,6 +45,10 @@ x-imagem-extrator: &imagem-extrator
     # por IP:porta, sem domínio nem proxy na frente.
     APP_USUARIO: ${APP_USUARIO:?defina APP_USUARIO}
     APP_SENHA: ${APP_SENHA:?defina APP_SENHA}
+    # Usuário Postgres SÓ DE LEITURA pro DBeaver (criado pelo faturas-migrar).
+    # Opcional: vazio = não cria.
+    DB_USUARIO_LEITURA: ${DB_USUARIO_LEITURA:-}
+    DB_SENHA_LEITURA: ${DB_SENHA_LEITURA:-}
   volumes:
     # File Mount do Dokploy (Advanced -> Mounts -> File Mount "contas.json").
     # Criar ANTES do primeiro deploy: se não existir, o Docker cria um
@@ -71,8 +75,13 @@ services:
       - faturas-db-dados:/var/lib/postgresql/data
     expose:
       - "5432"
+    # Só no 127.0.0.1 da VPS: nada chega de fora; o DBeaver do seu PC entra
+    # por túnel SSH (docs/deploy-dokploy.md, "Ver o banco no DBeaver").
+    ports:
+      - "127.0.0.1:${DB_PORTA_LOCAL:-5433}:5432"
     networks:
       - interno
+      - db-local
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" -h 127.0.0.1"]
       interval: 10s
@@ -233,3 +242,6 @@ networks:
   # Rede comum só pra app: numa rede internal: true o Docker não consegue
   # publicar a porta. Banco e storage continuam só na "interno".
   publico: {}
+  # Idem pro banco: publicar em 127.0.0.1 (DBeaver via SSH) exige uma rede
+  # que não seja internal. Só o faturas-db está nela.
+  db-local: {}
